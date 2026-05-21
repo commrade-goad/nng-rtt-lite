@@ -27,6 +27,15 @@
 #define REQ0_SELF_NAME "req"
 #define REQ0_PEER_NAME "rep"
 
+// Adaptive RTT/AIMD constants (from architecture spec)
+#define REQ0_RTO_INIT  3000   // ms
+#define REQ0_RTO_MIN   200    // ms
+#define REQ0_RTO_MAX   60000  // ms
+#define REQ0_AI_STEP   100    // ms additive increase bias
+#define REQ0_CWND_INIT 1
+#define REQ0_CWND_MIN  1
+#define REQ0_CWND_MAX  1024
+
 typedef struct req0_pipe req0_pipe;
 typedef struct req0_sock req0_sock;
 typedef struct req0_ctx  req0_ctx;
@@ -56,6 +65,12 @@ struct req0_ctx {
 	nni_duration  retry;
 	nni_time      retry_time; // retry after this expires
 	bool          conn_reset; // sent message w/o retry, peer disconnect
+
+	// Adaptive RTT/AIMD fields
+	nni_time      send_time;          // timestamp of first send
+	req0_pipe    *last_send_pipe;     // pipe that carried the request
+	bool          rtt_sample_eligible; // true if first-send (Karn's rule)
+	bool          retransmitted;      // set true after retry
 };
 
 // A req0_sock is our per-socket protocol private structure.
@@ -77,6 +92,19 @@ struct req0_sock {
 	nni_pollable   writable;
 	nni_duration   retry_tick; // clock interval for retry timer
 	nni_mtx        mtx;
+
+	// Socket-level baseline RTT estimator
+	nni_duration   srtt;
+	nni_duration   rttvar;
+	nni_duration   rto;
+	bool           rtt_initialized;
+
+	// Socket-level congestion window
+	uint32_t       cwnd;
+	uint32_t       inflight;
+
+	// Adaptive mode toggle (can be disabled for compatibility)
+	bool           adaptive;
 };
 
 // A req0_pipe is our per-pipe protocol private structure.
@@ -88,11 +116,81 @@ struct req0_pipe {
 	bool          closed;
 	nni_aio       aio_send;
 	nni_aio       aio_recv;
+
+	// Per-pipe RTT estimator
+	nni_duration  srtt;
+	nni_duration  rttvar;
+	nni_duration  rto;
+	bool          rtt_initialized;
+	uint32_t      samples;
+
+	// Per-pipe congestion window
+	uint32_t      cwnd;
+	uint32_t      inflight;
 };
 
 static void req0_sock_fini(void *);
 static void req0_send_cb(void *);
 static void req0_recv_cb(void *);
+
+// Clamp RTO to [RTO_MIN, RTO_MAX].
+static inline nni_duration
+req0_rto_clamp(nni_duration rto)
+{
+	if (rto < REQ0_RTO_MIN) {
+		rto = REQ0_RTO_MIN;
+	}
+	if (rto > REQ0_RTO_MAX) {
+		rto = REQ0_RTO_MAX;
+	}
+	return rto;
+}
+
+// Update RTT estimator on successful reply.
+// Uses RFC 6298 EWMA with additive increase bias.
+static void
+req0_rtt_update_success(
+    nni_duration *srtt, nni_duration *rttvar, nni_duration *rto,
+    bool *initialized, nni_duration sample)
+{
+	nni_duration err;
+
+	if (!(*initialized)) {
+		*srtt    = sample;
+		*rttvar  = (sample > 2) ? (sample / 2) : 1;
+		*initialized = true;
+	} else {
+		err     = sample - *srtt;
+		*srtt   = *srtt + err / 8;
+		*rttvar = *rttvar + ((err < 0 ? -err : err) - *rttvar) / 4;
+	}
+	// AIMD additive bias
+	*srtt = *srtt + REQ0_AI_STEP;
+	// Compute RTO
+	*rto = *srtt + 4 * (*rttvar);
+	*rto = req0_rto_clamp(*rto);
+}
+
+// Update RTT estimator on timeout (multiplicative decrease).
+static void
+req0_rtt_update_timeout(
+    nni_duration *srtt, nni_duration *rttvar, nni_duration *rto,
+    bool initialized)
+{
+	if (!initialized) {
+		return;
+	}
+	*srtt   = *srtt / 2;
+	if (*srtt < REQ0_RTO_MIN) {
+		*srtt = REQ0_RTO_MIN;
+	}
+	*rttvar = *rttvar / 2;
+	if (*rttvar < 1) {
+		*rttvar = 1;
+	}
+	*rto = *srtt + 4 * (*rttvar);
+	*rto = req0_rto_clamp(*rto);
+}
 
 static void
 req0_sock_init(void *arg, nni_sock *sock)
@@ -118,6 +216,15 @@ req0_sock_init(void *arg, nni_sock *sock)
 	// this is "semi random" start for request IDs.
 	s->retry      = NNI_SECOND * 60;
 	s->retry_tick = NNI_SECOND; // how often we check for retries
+
+	// Initialize socket-level baseline RTT estimator
+	s->srtt            = 0;
+	s->rttvar          = 0;
+	s->rto             = REQ0_RTO_INIT;
+	s->rtt_initialized = false;
+	s->cwnd            = REQ0_CWND_INIT;
+	s->inflight        = 0;
+	s->adaptive        = true;
 
 	req0_ctx_init(&s->master, s);
 
@@ -199,6 +306,16 @@ req0_pipe_init(void *arg, nni_pipe *pipe, void *s)
 	NNI_LIST_INIT(&p->contexts, req0_ctx, pipe_node);
 	p->pipe = pipe;
 	p->req  = s;
+
+	// Initialize per-pipe RTT estimator
+	p->srtt            = 0;
+	p->rttvar          = 0;
+	p->rto             = REQ0_RTO_INIT;
+	p->rtt_initialized = false;
+	p->samples         = 0;
+	p->cwnd            = REQ0_CWND_INIT;
+	p->inflight        = 0;
+
 	return (0);
 }
 
@@ -249,6 +366,24 @@ req0_pipe_close(void *arg)
 	while ((ctx = nni_list_first(&p->contexts)) != NULL) {
 		nni_list_remove(&p->contexts, ctx);
 		nng_aio *aio;
+
+		// Adaptive: invalidate pipe attribution for this context
+		if (ctx->last_send_pipe == p) {
+			ctx->last_send_pipe     = NULL;
+			ctx->rtt_sample_eligible = false;
+		}
+		// Decrement inflight counters and clear send_time to
+		// prevent double-decrement in ctx_reset.
+		if (s->adaptive && ctx->send_time > 0) {
+			if (p->inflight > 0) {
+				p->inflight--;
+			}
+			if (s->inflight > 0) {
+				s->inflight--;
+			}
+			ctx->send_time = 0;
+		}
+
 		if (ctx->retry <= 0) {
 			// If we can't retry, then just cancel the operation
 			// altogether.  We should only be waiting for recv,
@@ -366,6 +501,56 @@ req0_recv_cb(void *arg)
 	nni_list_node_remove(&ctx->send_node);
 	nni_id_remove(&s->requests, id);
 	ctx->request_id = 0;
+
+	// Adaptive RTT: compute sample and update estimator
+	if (s->adaptive && ctx->rtt_sample_eligible &&
+	    !ctx->retransmitted && ctx->send_time > 0) {
+		nni_time now_ts = nni_clock();
+		if (now_ts > ctx->send_time) {
+			nni_duration rtt_sample =
+			    (nni_duration)(now_ts - ctx->send_time);
+
+			// Update socket baseline estimator
+			req0_rtt_update_success(&s->srtt, &s->rttvar,
+			    &s->rto, &s->rtt_initialized, rtt_sample);
+
+			// Update per-pipe estimator if attribution valid
+			if (ctx->last_send_pipe == p) {
+				req0_rtt_update_success(&p->srtt, &p->rttvar,
+				    &p->rto, &p->rtt_initialized,
+				    rtt_sample);
+				p->samples++;
+			}
+		}
+
+		// CWND additive increase (no retransmit)
+		if (s->cwnd < REQ0_CWND_MAX) {
+			s->cwnd++;
+		}
+		if (ctx->last_send_pipe == p &&
+		    p->cwnd < REQ0_CWND_MAX) {
+			p->cwnd++;
+		}
+	}
+
+	// Decrement inflight counters
+	if (s->adaptive) {
+		if (s->inflight > 0) {
+			s->inflight--;
+		}
+		if (ctx->last_send_pipe != NULL &&
+		    ctx->last_send_pipe == p &&
+		    p->inflight > 0) {
+			p->inflight--;
+		}
+	}
+
+	// Clear adaptive state
+	ctx->last_send_pipe      = NULL;
+	ctx->rtt_sample_eligible = false;
+	ctx->retransmitted       = false;
+	ctx->send_time           = 0;
+
 	if (ctx->req_msg != NULL) {
 		// Only free msg if we originally cloned it (for retries)
 		if (ctx->retry > 0) {
@@ -373,6 +558,10 @@ req0_recv_cb(void *arg)
 		}
 		ctx->req_msg = NULL;
 	}
+
+	// Remove from retry queue since reply arrived
+	nni_list_node_remove(&ctx->retry_node);
+	nni_list_node_remove(&ctx->pipe_node);
 
 	// Is there an aio waiting for us?
 	if ((aio = ctx->recv_aio) != NULL) {
@@ -418,6 +607,33 @@ req0_retry_cb(void *arg)
 		if (ctx->retry_time > now || (ctx->req_msg == NULL)) {
 			continue;
 		}
+
+		// Adaptive: apply MD to estimator and cwnd on timeout
+		if (s->adaptive) {
+			req0_rtt_update_timeout(&s->srtt, &s->rttvar,
+			    &s->rto, s->rtt_initialized);
+			// CWND multiplicative decrease
+			s->cwnd = s->cwnd / 2;
+			if (s->cwnd < REQ0_CWND_MIN) {
+				s->cwnd = REQ0_CWND_MIN;
+			}
+			// Also update per-pipe estimator if valid
+			if (ctx->last_send_pipe != NULL &&
+			    !ctx->last_send_pipe->closed) {
+				req0_pipe *pp = ctx->last_send_pipe;
+				req0_rtt_update_timeout(&pp->srtt,
+				    &pp->rttvar, &pp->rto,
+				    pp->rtt_initialized);
+				pp->cwnd = pp->cwnd / 2;
+				if (pp->cwnd < REQ0_CWND_MIN) {
+					pp->cwnd = REQ0_CWND_MIN;
+				}
+			}
+			// Mark context as retransmitted (Karn's algorithm)
+			ctx->retransmitted       = true;
+			ctx->rtt_sample_eligible = false;
+		}
+
 		if (!nni_list_node_active(&ctx->send_node)) {
 			nni_list_append(&s->send_queue, ctx);
 		}
@@ -443,9 +659,13 @@ req0_ctx_init(void *arg, void *sock)
 	req0_ctx  *ctx = arg;
 
 	nni_mtx_lock(&s->mtx);
-	ctx->sock     = s;
-	ctx->recv_aio = NULL;
-	ctx->retry    = s->retry;
+	ctx->sock                = s;
+	ctx->recv_aio            = NULL;
+	ctx->retry               = s->retry;
+	ctx->send_time           = 0;
+	ctx->last_send_pipe      = NULL;
+	ctx->rtt_sample_eligible = false;
+	ctx->retransmitted       = false;
 	nni_list_append(&s->contexts, ctx);
 	nni_mtx_unlock(&s->mtx);
 }
@@ -496,9 +716,23 @@ req0_run_send_queue(req0_sock *s, nni_aio_completions *sent_list)
 	// Note: This routine should be called with the socket lock held.
 	while ((ctx = nni_list_first(&s->send_queue)) != NULL) {
 		req0_pipe *p;
+		bool       is_first_send;
 
 		if ((p = nni_list_first(&s->ready_pipes)) == NULL) {
 			return;
+		}
+
+		// Determine if this is a first-send or a retransmit.
+		// A retransmit has send_time already set.
+		is_first_send = (ctx->send_time == 0);
+
+		// Adaptive: cwnd gating for first-sends only.
+		// Retransmits bypass window check (already counted).
+		if (s->adaptive && is_first_send) {
+			if (s->inflight >= s->cwnd) {
+				// Window full, stop draining the queue.
+				return;
+			}
 		}
 
 		// We have a place to send it, so send it.
@@ -527,6 +761,16 @@ req0_run_send_queue(req0_sock *s, nni_aio_completions *sent_list)
 		nni_list_append(&s->busy_pipes, p);
 		if (nni_list_empty(&s->ready_pipes)) {
 			nni_pollable_clear(&s->writable);
+		}
+
+		// Adaptive: record attribution and increment inflight
+		if (s->adaptive && is_first_send) {
+			ctx->send_time           = nni_clock();
+			ctx->last_send_pipe      = p;
+			ctx->rtt_sample_eligible = true;
+			ctx->retransmitted       = false;
+			s->inflight++;
+			p->inflight++;
 		}
 
 		if ((aio = ctx->send_aio) != NULL) {
@@ -560,6 +804,17 @@ req0_ctx_reset(req0_ctx *ctx)
 	req0_sock *s = ctx->sock;
 	// Call with sock lock held!
 
+	// Adaptive: decrement inflight if this context was in-flight
+	if (s->adaptive && ctx->send_time > 0) {
+		if (s->inflight > 0) {
+			s->inflight--;
+		}
+		if (ctx->last_send_pipe != NULL &&
+		    ctx->last_send_pipe->inflight > 0) {
+			ctx->last_send_pipe->inflight--;
+		}
+	}
+
 	nni_list_node_remove(&ctx->retry_node);
 	nni_list_node_remove(&ctx->pipe_node);
 	nni_list_node_remove(&ctx->send_node);
@@ -578,7 +833,11 @@ req0_ctx_reset(req0_ctx *ctx)
 		nni_msg_free(ctx->rep_msg);
 		ctx->rep_msg = NULL;
 	}
-	ctx->conn_reset = false;
+	ctx->conn_reset          = false;
+	ctx->send_time           = 0;
+	ctx->last_send_pipe      = NULL;
+	ctx->rtt_sample_eligible = false;
+	ctx->retransmitted       = false;
 }
 
 static void
@@ -755,8 +1014,24 @@ req0_ctx_send(void *arg, nni_aio *aio)
 	ctx->send_aio = aio;
 	nni_aio_set_msg(aio, NULL);
 
+	// Initialize adaptive context state for this new request
+	ctx->send_time           = 0; // will be set in run_send_queue
+	ctx->last_send_pipe      = NULL;
+	ctx->rtt_sample_eligible = false;
+	ctx->retransmitted       = false;
+
 	if (ctx->retry > 0) {
-		ctx->retry_time = nni_clock() + ctx->retry;
+		// Use adaptive RTO for retry scheduling if available
+		nni_duration effective_retry = ctx->retry;
+		if (s->adaptive && s->rtt_initialized) {
+			effective_retry = s->rto;
+			// Respect configured retry as a cap
+			if (ctx->retry > 0 &&
+			    effective_retry > ctx->retry) {
+				effective_retry = ctx->retry;
+			}
+		}
+		ctx->retry_time = nni_clock() + effective_retry;
 		nni_list_append(&s->retry_queue, ctx);
 		if (!s->retry_active) {
 			s->retry_active = true;
@@ -867,6 +1142,46 @@ req0_sock_get_recv_fd(void *arg, int *fdp)
 	return (nni_pollable_getfd(&s->readable, fdp));
 }
 
+static nng_err
+req0_sock_set_adaptive(
+    void *arg, const void *buf, size_t sz, nni_opt_type t)
+{
+	req0_sock *s = arg;
+	bool       v;
+	nng_err    rv;
+
+	if ((rv = nni_copyin_bool(&v, buf, sz, t)) == NNG_OK) {
+		nni_mtx_lock(&s->mtx);
+		s->adaptive = v;
+		nni_mtx_unlock(&s->mtx);
+	}
+	return (rv);
+}
+
+static nng_err
+req0_sock_get_adaptive(void *arg, void *buf, size_t *szp, nni_opt_type t)
+{
+	req0_sock *s = arg;
+	bool       v;
+
+	nni_mtx_lock(&s->mtx);
+	v = s->adaptive;
+	nni_mtx_unlock(&s->mtx);
+	return (nni_copyout_bool(v, buf, szp, t));
+}
+
+static nng_err
+req0_sock_get_rto(void *arg, void *buf, size_t *szp, nni_opt_type t)
+{
+	req0_sock   *s = arg;
+	nng_duration rto;
+
+	nni_mtx_lock(&s->mtx);
+	rto = s->rto;
+	nni_mtx_unlock(&s->mtx);
+	return (nni_copyout_ms(rto, buf, szp, t));
+}
+
 static nni_proto_pipe_ops req0_pipe_ops = {
 	.pipe_size  = sizeof(req0_pipe),
 	.pipe_init  = req0_pipe_init,
@@ -911,6 +1226,15 @@ static nni_option req0_sock_options[] = {
 	    .o_name = NNG_OPT_REQ_RESENDTICK,
 	    .o_get  = req0_sock_get_resend_tick,
 	    .o_set  = req0_sock_set_resend_tick,
+	},
+	{
+	    .o_name = NNG_OPT_REQ_ADAPTIVE,
+	    .o_get  = req0_sock_get_adaptive,
+	    .o_set  = req0_sock_set_adaptive,
+	},
+	{
+	    .o_name = NNG_OPT_REQ_RTO,
+	    .o_get  = req0_sock_get_rto,
 	},
 
 	// terminate list

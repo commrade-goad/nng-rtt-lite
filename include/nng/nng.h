@@ -1712,6 +1712,8 @@ NNG_DECL int nng_req0_open(nng_socket *);
 NNG_DECL int nng_req0_open_raw(nng_socket *);
 #define NNG_OPT_REQ_RESENDTIME "req:resend-time"
 #define NNG_OPT_REQ_RESENDTICK "req:resend-tick"
+#define NNG_OPT_REQ_ADAPTIVE   "req:adaptive"
+#define NNG_OPT_REQ_RTO        "req:rto"
 
 // SURVEY0
 NNG_DECL int nng_respondent0_open(nng_socket *);
