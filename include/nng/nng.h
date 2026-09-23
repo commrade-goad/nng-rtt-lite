@@ -1721,6 +1721,9 @@ NNG_DECL int nng_respondent0_open_raw(nng_socket *);
 NNG_DECL int nng_surveyor0_open(nng_socket *);
 NNG_DECL int nng_surveyor0_open_raw(nng_socket *);
 #define NNG_OPT_SURVEYOR_SURVEYTIME "surveyor:survey-time"
+#define NNG_OPT_SURVEYOR_ADAPTIVE   "surveyor:adaptive"
+#define NNG_OPT_SURVEYOR_RTO        "surveyor:rto"
+#define NNG_OPT_SURVEYOR_CWND       "surveyor:cwnd"
 
 // These transition macros may help with migration from NNG1.
 // Applications should try to avoid depending on these any longer than

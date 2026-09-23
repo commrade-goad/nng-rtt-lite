@@ -164,10 +164,11 @@ req0_rtt_update_success(
 		*srtt   = *srtt + err / 8;
 		*rttvar = *rttvar + ((err < 0 ? -err : err) - *rttvar) / 4;
 	}
-	// AIMD additive bias
-	*srtt = *srtt + REQ0_AI_STEP;
-	// Compute RTO
-	*rto = *srtt + 4 * (*rttvar);
+	// NOTE: the AI_STEP bias is a fixed safety margin applied to the RTO
+	// computation only. It must NOT accumulate into srtt (adding it per
+	// sample would inflate srtt without bound, ~+100ms per reply).
+	// RTO with fixed AI safety margin (anti spurious timeout).
+	*rto = *srtt + 4 * (*rttvar) + REQ0_AI_STEP;
 	*rto = req0_rto_clamp(*rto);
 }
 

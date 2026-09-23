@@ -30,6 +30,16 @@
 #define SURVEYOR0_SELF_NAME "surveyor"
 #define SURVEYOR0_PEER_NAME "respondent"
 
+// Adaptive RTT/AIMD constants, mirroring req0 (see reqrep0/req.c).
+// RTO estimator follows RFC 6298 EWMA; cwnd follows AIMD.
+#define SURV0_RTO_INIT 3000   // ms
+#define SURV0_RTO_MIN  200    // ms
+#define SURV0_RTO_MAX  60000  // ms
+#define SURV0_AI_STEP  100    // ms additive increase bias
+#define SURV0_CWND_INIT 1
+#define SURV0_CWND_MIN  1
+#define SURV0_CWND_MAX  1024
+
 typedef struct surv0_pipe surv0_pipe;
 typedef struct surv0_sock surv0_sock;
 typedef struct surv0_ctx  surv0_ctx;
@@ -58,6 +68,19 @@ struct surv0_sock {
 	nni_pollable   writable;
 	nni_pollable   readable;
 	nni_atomic_int send_buf;
+
+	// Socket-level baseline RTT estimator (adaptive mode only).
+	nni_duration srtt;
+	nni_duration rttvar;
+	nni_duration rto;
+	bool         rtt_initialized;
+
+	// Socket-level congestion window (tracked for AIMD dynamics and
+	// observability; surveyor sends are not gated by it).
+	uint32_t cwnd;
+
+	// Adaptive mode toggle, off by default for upstream compatibility.
+	bool adaptive;
 };
 
 // surv0_pipe is our per-pipe protocol private structure.
@@ -70,7 +93,115 @@ struct surv0_pipe {
 	nni_aio       aio_recv;
 	bool          busy;
 	bool          closed;
+
+	// Per-pipe RTT estimator (adaptive mode only).
+	nni_duration srtt;
+	nni_duration rttvar;
+	nni_duration rto;
+	bool         rtt_initialized;
+	uint32_t     samples;
+
+	// Per-pipe congestion window (tracked, not gating).
+	uint32_t cwnd;
+
+	// Attribution for the latest survey handed to this pipe:
+	// its id and the transmit timestamp (0 = none outstanding).
+	uint32_t survey_out;
+	nni_time send_time;
 };
+
+// Clamp RTO to [RTO_MIN, RTO_MAX].
+static inline nni_duration
+surv0_rto_clamp(nni_duration rto)
+{
+	if (rto < SURV0_RTO_MIN) {
+		rto = SURV0_RTO_MIN;
+	}
+	if (rto > SURV0_RTO_MAX) {
+		rto = SURV0_RTO_MAX;
+	}
+	return rto;
+}
+
+// Update RTT estimator on a timely reply (RFC 6298 EWMA with
+// additive-increase bias). Late replies never reach here: they miss
+// the survey id lookup and are discarded, so no Karn ambiguity arises.
+//
+// NOTE: the AI_STEP bias is a fixed safety margin applied to the RTO
+// computation only. It must NOT accumulate into srtt (adding it per
+// sample would inflate srtt without bound, ~+100ms per reply).
+static void
+surv0_rtt_update_success(nni_duration *srtt, nni_duration *rttvar,
+    nni_duration *rto, bool *initialized, nni_duration sample)
+{
+	nni_duration err;
+
+	if (!(*initialized)) {
+		*srtt        = sample;
+		*rttvar      = (sample > 2) ? (sample / 2) : 1;
+		*initialized = true;
+	} else {
+		err     = sample - *srtt;
+		*srtt   = *srtt + err / 8;
+		*rttvar = *rttvar + ((err < 0 ? -err : err) - *rttvar) / 4;
+	}
+	// RTO with fixed AI safety margin (anti spurious timeout).
+	*rto = *srtt + 4 * (*rttvar) + SURV0_AI_STEP;
+	*rto = surv0_rto_clamp(*rto);
+}
+
+// Update RTT estimator on a missed reply (multiplicative decrease).
+static void
+surv0_rtt_update_timeout(nni_duration *srtt, nni_duration *rttvar,
+    nni_duration *rto, bool initialized)
+{
+	if (!initialized) {
+		return;
+	}
+	*srtt = *srtt / 2;
+	if (*srtt < SURV0_RTO_MIN) {
+		*srtt = SURV0_RTO_MIN;
+	}
+	*rttvar = *rttvar / 2;
+	if (*rttvar < 1) {
+		*rttvar = 1;
+	}
+	*rto = *srtt + 4 * (*rttvar);
+	*rto = surv0_rto_clamp(*rto);
+}
+
+// Settle the books of a superseded survey: every pipe that was handed
+// the survey but never replied gets MD treatment. Called with the
+// socket lock held, before the survey id is retired.
+static void
+surv0_settle_survey(surv0_sock *sock, uint32_t survey_id)
+{
+	surv0_pipe *pipe;
+
+	if (survey_id == 0) {
+		return;
+	}
+	NNI_LIST_FOREACH (&sock->pipes, pipe) {
+		if (pipe->send_time == 0 || pipe->survey_out != survey_id) {
+			continue;
+		}
+		pipe->send_time  = 0;
+		pipe->survey_out = 0;
+		surv0_rtt_update_timeout(
+		    &pipe->srtt, &pipe->rttvar, &pipe->rto, pipe->rtt_initialized);
+		surv0_rtt_update_timeout(
+		    &sock->srtt, &sock->rttvar, &sock->rto, sock->rtt_initialized);
+		pipe->cwnd /= 2;
+		if (pipe->cwnd < SURV0_CWND_MIN) {
+			pipe->cwnd = SURV0_CWND_MIN;
+		}
+		sock->cwnd /= 2;
+		if (sock->cwnd < SURV0_CWND_MIN) {
+			sock->cwnd = SURV0_CWND_MIN;
+		}
+	}
+}
+
 
 static void
 surv0_ctx_abort(surv0_ctx *ctx, int err)
@@ -150,6 +281,14 @@ surv0_ctx_cancel(nni_aio *aio, void *arg, nng_err rv)
 		nni_aio_finish_error(aio, rv);
 	}
 	if (ctx->survey_id != 0) {
+		// Adaptive: a cancelled receive (e.g. survey deadline
+		// expiry) ends collection for this survey. Pipes that
+		// never replied get MD treatment now: the next send
+		// cannot see them, because ctx_send clears survey_id
+		// (via this same path) before it could settle them.
+		if (sock->adaptive) {
+			surv0_settle_survey(sock, ctx->survey_id);
+		}
 		nni_id_remove(&sock->surveys, ctx->survey_id);
 		ctx->survey_id = 0;
 	}
@@ -216,6 +355,12 @@ surv0_ctx_send(void *arg, nni_aio *aio)
 
 	nni_mtx_lock(&sock->mtx);
 
+	// Adaptive: settle the superseded survey first. Pipes that never
+	// replied to it get multiplicative-decrease treatment.
+	if (sock->adaptive) {
+		surv0_settle_survey(sock, ctx->survey_id);
+	}
+
 	// Abort everything outstanding.
 	surv0_ctx_abort(ctx, NNG_ECANCELED);
 
@@ -243,12 +388,30 @@ surv0_ctx_send(void *arg, nni_aio *aio)
 		} else if (!nni_lmq_full(&pipe->send_queue)) {
 			nni_msg_clone(msg);
 			nni_lmq_put(&pipe->send_queue, msg);
+		} else {
+			continue;
+		}
+		// Adaptive: attribute this survey to the pipe for RTT
+		// sampling when its reply arrives.
+		if (sock->adaptive) {
+			pipe->survey_out = ctx->survey_id;
+			pipe->send_time  = nni_clock();
 		}
 	}
 
 	// save the survey time, so we know the maximum timeout to use when
-	// waiting for receive
-	ctx->expire = nni_clock() + survey_time;
+	// waiting for receive. With adaptive mode and a trained estimator,
+	// the RTO (capped by the configured survey time) is used instead,
+	// so the survey tracks what the network actually needs.
+	if (sock->adaptive && sock->rtt_initialized) {
+		nni_duration rto = sock->rto;
+		if (rto > survey_time) {
+			rto = survey_time;
+		}
+		ctx->expire = nni_clock() + rto;
+	} else {
+		ctx->expire = nni_clock() + survey_time;
+	}
 
 	nni_mtx_unlock(&sock->mtx);
 	nni_msg_free(msg);
@@ -295,6 +458,15 @@ surv0_sock_init(void *arg, nni_sock *s)
 	nni_id_map_init(&sock->surveys, 0x80000000u, 0xffffffffu, true);
 
 	surv0_ctx_init(&sock->ctx, sock);
+
+	// Adaptive RTT/AIMD state. Off by default; the RTT-lite bridge
+	// opts in via NNG_OPT_SURVEYOR_ADAPTIVE.
+	sock->srtt            = 0;
+	sock->rttvar          = 0;
+	sock->rto             = SURV0_RTO_INIT;
+	sock->rtt_initialized = false;
+	sock->cwnd            = SURV0_CWND_INIT;
+	sock->adaptive        = false;
 
 	sock->ttl = 8;
 }
@@ -350,6 +522,16 @@ surv0_pipe_init(void *arg, nni_pipe *pipe, void *s)
 
 	p->pipe = pipe;
 	p->sock = sock;
+
+	// Adaptive per-pipe RTT/AIMD state.
+	p->srtt            = 0;
+	p->rttvar          = 0;
+	p->rto             = SURV0_RTO_INIT;
+	p->rtt_initialized = false;
+	p->samples         = 0;
+	p->cwnd            = SURV0_CWND_INIT;
+	p->survey_out      = 0;
+	p->send_time       = 0;
 	return (0);
 }
 
@@ -389,6 +571,11 @@ surv0_pipe_close(void *arg)
 	if (nni_list_active(&s->pipes, p)) {
 		nni_list_remove(&s->pipes, p);
 	}
+	// Adaptive: drop any outstanding attribution so a dead pipe can
+	// never produce a sample later. No estimator update: a dropped
+	// connection is not a congestion signal.
+	p->send_time  = 0;
+	p->survey_out = 0;
 	nni_mtx_unlock(&s->mtx);
 }
 
@@ -455,6 +642,7 @@ surv0_pipe_recv_cb(void *arg)
 	if (((ctx = nni_id_get(&sock->surveys, id)) == NULL) ||
 	    (nni_lmq_full(&ctx->recv_lmq))) {
 		nni_msg_free(msg);
+		msg = NULL; // unmatched: no RTT sample below
 	} else if ((aio = nni_list_first(&ctx->recv_queue)) != NULL) {
 		nni_list_remove(&ctx->recv_queue, aio);
 		nni_aio_finish_msg(aio, msg);
@@ -463,6 +651,31 @@ surv0_pipe_recv_cb(void *arg)
 		if (ctx == &sock->ctx) {
 			nni_pollable_raise(&sock->readable);
 		}
+	}
+
+	// Adaptive RTT: sample per-pipe latency for matched replies.
+	// Only the first reply per pipe per survey counts; late replies
+	// never reach here (their survey id is already retired).
+	if (msg != NULL && sock->adaptive && p->send_time != 0 &&
+	    p->survey_out == id) {
+		nni_time now_ts = nni_clock();
+		if (now_ts > p->send_time) {
+			nni_duration sample =
+			    (nni_duration) (now_ts - p->send_time);
+			surv0_rtt_update_success(&sock->srtt, &sock->rttvar,
+			    &sock->rto, &sock->rtt_initialized, sample);
+			surv0_rtt_update_success(&p->srtt, &p->rttvar,
+			    &p->rto, &p->rtt_initialized, sample);
+			p->samples++;
+			if (sock->cwnd < SURV0_CWND_MAX) {
+				sock->cwnd++;
+			}
+			if (p->cwnd < SURV0_CWND_MAX) {
+				p->cwnd++;
+			}
+		}
+		p->send_time  = 0;
+		p->survey_out = 0;
 	}
 	nni_mtx_unlock(&sock->mtx);
 
@@ -517,6 +730,58 @@ surv0_sock_get_survey_time(void *arg, void *buf, size_t *szp, nni_opt_type t)
 {
 	surv0_sock *s = arg;
 	return (surv0_ctx_get_survey_time(&s->ctx, buf, szp, t));
+}
+
+static nng_err
+surv0_sock_set_adaptive(
+    void *arg, const void *buf, size_t sz, nni_opt_type t)
+{
+	surv0_sock *s = arg;
+	bool        v;
+	nng_err     rv;
+
+	if ((rv = nni_copyin_bool(&v, buf, sz, t)) == NNG_OK) {
+		nni_mtx_lock(&s->mtx);
+		s->adaptive = v;
+		nni_mtx_unlock(&s->mtx);
+	}
+	return (rv);
+}
+
+static nng_err
+surv0_sock_get_adaptive(void *arg, void *buf, size_t *szp, nni_opt_type t)
+{
+	surv0_sock *s = arg;
+	bool        v;
+
+	nni_mtx_lock(&s->mtx);
+	v = s->adaptive;
+	nni_mtx_unlock(&s->mtx);
+	return (nni_copyout_bool(v, buf, szp, t));
+}
+
+static nng_err
+surv0_sock_get_rto(void *arg, void *buf, size_t *szp, nni_opt_type t)
+{
+	surv0_sock  *s = arg;
+	nng_duration rto;
+
+	nni_mtx_lock(&s->mtx);
+	rto = s->rto;
+	nni_mtx_unlock(&s->mtx);
+	return (nni_copyout_ms(rto, buf, szp, t));
+}
+
+static nng_err
+surv0_sock_get_cwnd(void *arg, void *buf, size_t *szp, nni_opt_type t)
+{
+	surv0_sock *s = arg;
+	int         cwnd;
+
+	nni_mtx_lock(&s->mtx);
+	cwnd = (int) s->cwnd;
+	nni_mtx_unlock(&s->mtx);
+	return (nni_copyout_int(cwnd, buf, szp, t));
 }
 
 static nng_err
@@ -587,6 +852,19 @@ static nni_option surv0_sock_options[] = {
 	    .o_name = NNG_OPT_MAXTTL,
 	    .o_get  = surv0_sock_get_max_ttl,
 	    .o_set  = surv0_sock_set_max_ttl,
+	},
+	{
+	    .o_name = NNG_OPT_SURVEYOR_ADAPTIVE,
+	    .o_get  = surv0_sock_get_adaptive,
+	    .o_set  = surv0_sock_set_adaptive,
+	},
+	{
+	    .o_name = NNG_OPT_SURVEYOR_RTO,
+	    .o_get  = surv0_sock_get_rto,
+	},
+	{
+	    .o_name = NNG_OPT_SURVEYOR_CWND,
+	    .o_get  = surv0_sock_get_cwnd,
 	},
 	// terminate list
 	{
