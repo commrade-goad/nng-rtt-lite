@@ -7,6 +7,13 @@
 
 #include <string.h>
 
+// NOTE: all #define aliases are at the BOTTOM of this header, after every
+// function body. They are object-like macros (#define nng_send X), which
+// expand everywhere regardless of parentheses, so placing them earlier
+// would make the inner "real" calls below recursively expand into the
+// wrappers themselves (rep side would send an ACK then block waiting for
+// a phantom second ACK, swallowing the next request).
+
 /**
  * @brief Wrapper for nng_pub0_open that redirects to req0 and sets adaptive options.
  */
@@ -26,10 +33,6 @@ static inline int nng_sub0_open_reliable(nng_socket *sock) {
     return nng_rep0_open(sock);
 }
 
-// Override open functions
-#define nng_pub0_open nng_pub0_open_reliable
-#define nng_sub0_open nng_sub0_open_reliable
-
 /**
  * @brief Wrapper for nng_send that handles the synchronous request-reply ACK cycle.
  */
@@ -46,7 +49,6 @@ static inline int nng_send_reliable(nng_socket sock, void *data, size_t size, in
     rv = nng_recv(sock, ack_buf, &ack_sz, 0);
     return rv;
 }
-#define nng_send nng_send_reliable
 
 /**
  * @brief Wrapper for nng_recvmsg that receives a request and automatically replies with an ACK.
@@ -66,7 +68,6 @@ static inline int nng_recvmsg_reliable(nng_socket sock, nng_msg **msgp, int flag
     }
     return 0;
 }
-#define nng_recvmsg nng_recvmsg_reliable
 
 /**
  * @brief Wrapper for nng_recv that receives data and automatically replies with an ACK.
@@ -84,6 +85,13 @@ static inline int nng_recv_reliable(nng_socket sock, void *data, size_t *sizep, 
     }
     return 0;
 }
+
+// Override pub/sub functions with the reliable bridge.
+// Must stay after all definitions above (see NOTE at top).
+#define nng_pub0_open nng_pub0_open_reliable
+#define nng_sub0_open nng_sub0_open_reliable
+#define nng_send nng_send_reliable
+#define nng_recvmsg nng_recvmsg_reliable
 #define nng_recv nng_recv_reliable
 
 #endif // NNG_PUBSUB_RELIABLE

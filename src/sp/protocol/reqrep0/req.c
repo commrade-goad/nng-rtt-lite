@@ -217,14 +217,18 @@ req0_sock_init(void *arg, nni_sock *sock)
 	s->retry      = NNI_SECOND * 60;
 	s->retry_tick = NNI_SECOND; // how often we check for retries
 
-	// Initialize socket-level baseline RTT estimator
+	// Initialize socket-level baseline RTT estimator.
+	// Adaptive mode defaults to OFF so plain NNG applications keep
+	// exact upstream semantics (unlimited outstanding requests per
+	// context, immediate resend on disconnect). The nng-rtt-lite
+	// bridge (nng_wrapper.h) opts in via NNG_OPT_REQ_ADAPTIVE.
 	s->srtt            = 0;
 	s->rttvar          = 0;
 	s->rto             = REQ0_RTO_INIT;
 	s->rtt_initialized = false;
 	s->cwnd            = REQ0_CWND_INIT;
 	s->inflight        = 0;
-	s->adaptive        = true;
+	s->adaptive        = false;
 
 	req0_ctx_init(&s->master, s);
 
