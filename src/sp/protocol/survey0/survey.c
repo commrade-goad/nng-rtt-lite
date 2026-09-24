@@ -39,6 +39,8 @@
 #define SURV0_CWND_INIT 1
 #define SURV0_CWND_MIN  1
 #define SURV0_CWND_MAX  1024
+#define SURV0_RING_MAX  8   // repair window: last N surveys kept for resend
+#define SURV0_RESEND_TICK 100 // ms between resend scans
 
 typedef struct surv0_pipe surv0_pipe;
 typedef struct surv0_sock surv0_sock;
@@ -46,6 +48,7 @@ typedef struct surv0_ctx  surv0_ctx;
 
 static void surv0_pipe_send_cb(void *);
 static void surv0_pipe_recv_cb(void *);
+static void surv0_resend_cb(void *);
 
 struct surv0_ctx {
 	surv0_sock    *sock;
@@ -81,6 +84,17 @@ struct surv0_sock {
 
 	// Adaptive mode toggle, off by default for upstream compatibility.
 	bool adaptive;
+
+	// Repair ring (adaptive only): last SURV0_RING_MAX surveys, cloned
+	// with headers intact, for timer-driven republish on missed replies.
+	// ring_seq holds the survey id per slot (0 = empty slot).
+	nni_msg *ring[SURV0_RING_MAX];
+	uint32_t ring_seq[SURV0_RING_MAX];
+	uint8_t  ring_pos;
+
+	// Resend timer: scans pipes for unreplied surveys older than RTO.
+	nni_aio resend_aio;
+	bool    resend_active;
 };
 
 // surv0_pipe is our per-pipe protocol private structure.
@@ -108,6 +122,11 @@ struct surv0_pipe {
 	// its id and the transmit timestamp (0 = none outstanding).
 	uint32_t survey_out;
 	nni_time send_time;
+
+	// Set when the outstanding survey was republished by the resend
+	// timer. Replies to republished surveys are still delivered, but
+	// skipped for RTT sampling (Karn's rule: no samples off retries).
+	bool resent;
 };
 
 // Clamp RTO to [RTO_MIN, RTO_MAX].
@@ -170,6 +189,28 @@ surv0_rtt_update_timeout(nni_duration *srtt, nni_duration *rttvar,
 	*rto = surv0_rto_clamp(*rto);
 }
 
+// Apply a "miss" to one pipe: drop its attribution, decay its
+// estimator and halve both congestion windows (multiplicative
+// decrease). Called with the socket lock held.
+static void
+surv0_pipe_missed(surv0_sock *s, surv0_pipe *p)
+{
+	p->send_time  = 0;
+	p->survey_out = 0;
+	surv0_rtt_update_timeout(
+	    &p->srtt, &p->rttvar, &p->rto, p->rtt_initialized);
+	surv0_rtt_update_timeout(
+	    &s->srtt, &s->rttvar, &s->rto, s->rtt_initialized);
+	p->cwnd /= 2;
+	if (p->cwnd < SURV0_CWND_MIN) {
+		p->cwnd = SURV0_CWND_MIN;
+	}
+	s->cwnd /= 2;
+	if (s->cwnd < SURV0_CWND_MIN) {
+		s->cwnd = SURV0_CWND_MIN;
+	}
+}
+
 // Settle the books of a superseded survey: every pipe that was handed
 // the survey but never replied gets MD treatment. Called with the
 // socket lock held, before the survey id is retired.
@@ -185,20 +226,7 @@ surv0_settle_survey(surv0_sock *sock, uint32_t survey_id)
 		if (pipe->send_time == 0 || pipe->survey_out != survey_id) {
 			continue;
 		}
-		pipe->send_time  = 0;
-		pipe->survey_out = 0;
-		surv0_rtt_update_timeout(
-		    &pipe->srtt, &pipe->rttvar, &pipe->rto, pipe->rtt_initialized);
-		surv0_rtt_update_timeout(
-		    &sock->srtt, &sock->rttvar, &sock->rto, sock->rtt_initialized);
-		pipe->cwnd /= 2;
-		if (pipe->cwnd < SURV0_CWND_MIN) {
-			pipe->cwnd = SURV0_CWND_MIN;
-		}
-		sock->cwnd /= 2;
-		if (sock->cwnd < SURV0_CWND_MIN) {
-			sock->cwnd = SURV0_CWND_MIN;
-		}
+		surv0_pipe_missed(sock, pipe);
 	}
 }
 
@@ -396,6 +424,25 @@ surv0_ctx_send(void *arg, nni_aio *aio)
 		if (sock->adaptive) {
 			pipe->survey_out = ctx->survey_id;
 			pipe->send_time  = nni_clock();
+			pipe->resent     = false;
+		}
+	}
+
+	// Adaptive: file this survey in the repair ring (shared reference;
+	// freed on eviction or socket teardown) and make sure the resend
+	// timer is running while anything is outstanding.
+	if (sock->adaptive) {
+		uint8_t slot = sock->ring_pos;
+		nni_msg_clone(msg);
+		if (sock->ring[slot] != NULL) {
+			nni_msg_free(sock->ring[slot]);
+		}
+		sock->ring[slot]     = msg;
+		sock->ring_seq[slot] = ctx->survey_id;
+		sock->ring_pos       = (uint8_t) ((slot + 1) % SURV0_RING_MAX);
+		if (!sock->resend_active && !nni_list_empty(&sock->pipes)) {
+			sock->resend_active = true;
+			nni_sleep_aio(SURV0_RESEND_TICK, &sock->resend_aio);
 		}
 	}
 
@@ -424,6 +471,13 @@ surv0_sock_fini(void *arg)
 {
 	surv0_sock *sock = arg;
 
+	for (int i = 0; i < SURV0_RING_MAX; i++) {
+		if (sock->ring[i] != NULL) {
+			nni_msg_free(sock->ring[i]);
+			sock->ring[i] = NULL;
+		}
+	}
+	nni_aio_fini(&sock->resend_aio);
 	surv0_ctx_fini(&sock->ctx);
 	nni_id_map_fini(&sock->surveys);
 	nni_pollable_fini(&sock->writable);
@@ -467,6 +521,13 @@ surv0_sock_init(void *arg, nni_sock *s)
 	sock->rtt_initialized = false;
 	sock->cwnd            = SURV0_CWND_INIT;
 	sock->adaptive        = false;
+	for (int i = 0; i < SURV0_RING_MAX; i++) {
+		sock->ring[i]     = NULL;
+		sock->ring_seq[i] = 0;
+	}
+	sock->ring_pos      = 0;
+	sock->resend_active = false;
+	nni_aio_init(&sock->resend_aio, surv0_resend_cb, sock);
 
 	sock->ttl = 8;
 }
@@ -482,6 +543,7 @@ surv0_sock_close(void *arg)
 {
 	surv0_sock *s = arg;
 
+	nni_aio_stop(&s->resend_aio);
 	surv0_ctx_close(&s->ctx);
 }
 
@@ -532,6 +594,7 @@ surv0_pipe_init(void *arg, nni_pipe *pipe, void *s)
 	p->cwnd            = SURV0_CWND_INIT;
 	p->survey_out      = 0;
 	p->send_time       = 0;
+	p->resent          = false;
 	return (0);
 }
 
@@ -576,6 +639,82 @@ surv0_pipe_close(void *arg)
 	// connection is not a congestion signal.
 	p->send_time  = 0;
 	p->survey_out = 0;
+	p->resent     = false;
+	nni_mtx_unlock(&s->mtx);
+}
+
+// Resend timer: republish surveys that went unreplied past RTO.
+// Runs every SURV0_RESEND_TICK while any pipe has anything outstanding.
+// Republishes use the ORIGINAL survey id (still registered: nothing was
+// aborted), so replies match normally; the subscriber's deliver-once
+// rule turns repeats into harmless drops. Surveys older than the repair
+// ring get MD treatment once instead of a resend (window horizon).
+static void
+surv0_resend_cb(void *arg)
+{
+	surv0_sock *s = arg;
+	surv0_pipe *p;
+	nni_time    now;
+	bool        more = false;
+
+	nni_mtx_lock(&s->mtx);
+	if (!s->adaptive || (nni_aio_result(&s->resend_aio) != 0)) {
+		s->resend_active = false;
+		nni_mtx_unlock(&s->mtx);
+		return;
+	}
+	now = nni_clock();
+	NNI_LIST_FOREACH (&s->pipes, p) {
+		nni_msg     *found = NULL;
+		nni_duration tmo;
+
+		if (p->send_time == 0) {
+			continue;
+		}
+		tmo = p->rtt_initialized ? p->rto : SURV0_RTO_INIT;
+		if (now <= p->send_time ||
+		    (now - p->send_time) <= (nni_time) tmo) {
+			continue;
+		}
+		for (int i = 0; i < SURV0_RING_MAX; i++) {
+			if (s->ring[i] != NULL && s->ring_seq[i] == p->survey_out) {
+				found = s->ring[i];
+				break;
+			}
+		}
+		if (found == NULL) {
+			// Older than the repair window: MD once, give up.
+			surv0_pipe_missed(s, p);
+			continue;
+		}
+		if (!p->busy) {
+			p->busy = true;
+			nni_msg_clone(found);
+			nni_aio_set_msg(&p->aio_send, found);
+			nni_pipe_send(p->pipe, &p->aio_send);
+		} else if (!nni_lmq_full(&p->send_queue)) {
+			nni_msg_clone(found);
+			nni_lmq_put(&p->send_queue, found);
+		} else {
+			continue;
+		}
+		// Re-base the sample clock to this transmit and mark the
+		// survey resent (Karn: its eventual reply is not sampled).
+		// Repeats are bounded: the next resend needs another full RTO.
+		p->send_time = now;
+		p->resent    = true;
+	}
+	NNI_LIST_FOREACH (&s->pipes, p) {
+		if (p->send_time != 0) {
+			more = true;
+			break;
+		}
+	}
+	if (more) {
+		nni_sleep_aio(SURV0_RESEND_TICK, &s->resend_aio);
+	} else {
+		s->resend_active = false;
+	}
 	nni_mtx_unlock(&s->mtx);
 }
 
@@ -655,9 +794,10 @@ surv0_pipe_recv_cb(void *arg)
 
 	// Adaptive RTT: sample per-pipe latency for matched replies.
 	// Only the first reply per pipe per survey counts; late replies
-	// never reach here (their survey id is already retired).
-	if (msg != NULL && sock->adaptive && p->send_time != 0 &&
-	    p->survey_out == id) {
+	// never reach here (their survey id is already retired). Replies
+	// to timer-resent surveys are delivered but not sampled (Karn).
+	if (msg != NULL && sock->adaptive && !p->resent &&
+	    p->send_time != 0 && p->survey_out == id) {
 		nni_time now_ts = nni_clock();
 		if (now_ts > p->send_time) {
 			nni_duration sample =
