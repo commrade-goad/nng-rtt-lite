@@ -76,6 +76,12 @@ mark_as_advanced(NNG_PROTO_RESPONDENT0)
 option (NNG_PROTO_SURVEYOR0 "Enable SURVEYORv0 protocol." ON)
 mark_as_advanced(NNG_PROTO_SURVEYOR0)
 
+option (NNG_PROTO_SACKRESP0 "Enable SACKRESPv0 protocol." ON)
+mark_as_advanced(NNG_PROTO_SACKRESP0)
+
+option (NNG_PROTO_SACK0 "Enable SACKv0 protocol." ON)
+mark_as_advanced(NNG_PROTO_SACK0)
+
 # TLS support.
 
 # Enabling TLS is required to enable support for the TLS transport

@@ -3,7 +3,8 @@
 
 #include <nng/nng.h>
 
-#if defined(NNG_PUBSUB_SURVEY) || defined(NNG_PUBSUB_RELIABLE)
+#if defined(NNG_PUBSUB_SURVEY) || defined(NNG_PUBSUB_RELIABLE) || \
+    defined(NNG_PUBSUB_SACK)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -360,12 +361,473 @@ static inline int nng_recv_reliable(nng_socket sock, void *data, size_t *sizep, 
     return 0;
 }
 
-#endif // mode selection
+#endif // mode selection (survey/reliable)
+
+#if defined(NNG_PUBSUB_SACK)
+
+// Cumulative-ACK bridge over the sack/sackresp protocol: the publisher
+// pipelines surveys WITHOUT waiting (window SACK0_RING_MAX = 8, one
+// #define in sack.c), and each subscriber answers once per batch with
+// "C<next>[:mask]" ("everything below <next> done, plus SACK bits").
+// 10 msgs cost ~2 uplink ACKs instead of 10. RTT-lite AIMD lives in
+// sack.c and is enabled here. All subscribers get everything: the
+// publisher resends per-pipe holes until each pipe cumulatively acks.
+
+static nng_duration nng_sack_deadline_ms = 2000;
+static uint32_t     nng_sack_seq_next    = 1; // pub side; one pub thread
+
+// Batch + delayed-ACK tunables. NNG_SACK_BATCH must stay <= the
+// protocol window SACK0_RING_MAX (8, one #define in sack.c): one
+// cumulative per batch. NNG_SACK_ACK_DELAY_MS bounds tail latency:
+// a partial batch flushes at most this long after it stopped growing,
+// even while the app is blocked in nng_recv.
+#define NNG_SACK_BATCH 8
+#define NNG_SACK_ACK_DELAY_MS 50
+// Per-subscriber cumulative state: last = highest contiguous wrapper
+// seq delivered, bits = SACK for last+1..last+16 (LSB = last+1),
+// pending = new deliveries since the last flushed C.
+#define NNG_SACK_SLOTS 16
+struct nng_sack_slot {
+    bool     used;
+    int      sock_id;
+    uint32_t last;
+    uint32_t bits;
+    int      pending;
+};
+static struct nng_sack_slot nng_sack_seen[NNG_SACK_SLOTS] = { { 0 } };
+
+static inline struct nng_sack_slot *
+nng_sack_state_for(nng_socket sock, bool create)
+{
+    int id = nng_socket_id(sock);
+    for (int i = 0; i < NNG_SACK_SLOTS; i++) {
+        if (nng_sack_seen[i].used && nng_sack_seen[i].sock_id == id) {
+            return &nng_sack_seen[i];
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    for (int i = 0; i < NNG_SACK_SLOTS; i++) {
+        if (!nng_sack_seen[i].used) {
+            nng_sack_seen[i].used    = true;
+            nng_sack_seen[i].sock_id = id;
+            nng_sack_seen[i].last    = 0;
+            nng_sack_seen[i].bits    = 0;
+            nng_sack_seen[i].pending = 0;
+            return &nng_sack_seen[i];
+        }
+    }
+    return NULL;
+}
+
+// Split "<seq>|<rest>" (same as survey mode). Returns prefix length or 0.
+static inline int
+nng_sack_split_seq(const char *body, size_t len, uint32_t *seq)
+{
+    size_t i = 0;
+    uint32_t v = 0;
+    if (len == 0) {
+        return 0;
+    }
+    while (i < len && body[i] >= '0' && body[i] <= '9') {
+        v = v * 10 + (uint32_t) (body[i] - '0');
+        i++;
+    }
+    if (i == 0 || i >= len || body[i] != '|') {
+        return 0;
+    }
+    *seq = v;
+    return (int) (i + 1);
+}
+
+// Parse "C<next>[:maskhex]" (mirror of sack.c). Returns next, 0 = invalid.
+static inline uint32_t
+nng_sack_parse_next(const char *body, size_t len, uint32_t *maskp)
+{
+    size_t i = 1;
+    uint32_t v = 0, m = 0;
+    int nd = 0, hd = 0;
+    if (len < 2 || body[0] != 'C') {
+        return 0;
+    }
+    while (i < len && body[i] >= '0' && body[i] <= '9') {
+        v = v * 10 + (uint32_t) (body[i] - '0');
+        i++;
+        nd++;
+    }
+    if (nd == 0 || v == 0) {
+        return 0;
+    }
+    if (i < len && body[i] == ':') {
+        i++;
+        while (i < len && hd < 8) {
+            char c = body[i];
+            uint32_t d;
+            if (c >= '0' && c <= '9') {
+                d = (uint32_t) (c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                d = (uint32_t) (c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                d = (uint32_t) (c - 'A' + 10);
+            } else {
+                break;
+            }
+            m = (m << 4) | d;
+            i++;
+            hd++;
+        }
+        if (hd == 0) {
+            return 0;
+        }
+    }
+    if (maskp != NULL) {
+        *maskp = m;
+    }
+    return v;
+}
+
+/**
+ * @brief Wrapper for nng_pub0_open that redirects to sack.
+ */
+static inline int nng_pub0_open_sack(nng_socket *sock) {
+    int rv = nng_sack0_open(sock);
+    if (rv == 0) {
+        nng_socket_set_ms(
+            *sock, NNG_OPT_SACK_SURVEYTIME, nng_sack_deadline_ms);
+        nng_socket_set_bool(*sock, NNG_OPT_SACK_ADAPTIVE, true);
+    }
+    return rv;
+}
+
+/**
+ * @brief Wrapper for nng_sub0_open that redirects to sackresp.
+ */
+static inline int nng_sub0_open_sack(nng_socket *sock) {
+    return nng_sackresp0_open(sock);
+}
+
+/**
+ * @brief Wrapper for nng_send: pipeline a survey, do NOT wait.
+ *
+ * Prepends "<seq>|" and returns once queued. ACKs arrive async as
+ * "C<next>[:mask]" batches (one per ~8 surveys); drain them with
+ * nng_sack_sync() or plain nng_recv on the pub socket.
+ */
+static inline int nng_send_sack(
+    nng_socket sock, void *data, size_t size, int flags) {
+    uint32_t seq = nng_sack_seq_next++;
+    char     prefix[16];
+    int      plen = snprintf(prefix, sizeof(prefix), "%u|", seq);
+    char    *buf  = (char *) malloc((size_t) plen + size);
+    int      rv;
+    if (buf == NULL) {
+        return NNG_ENOMEM;
+    }
+    memcpy(buf, prefix, (size_t) plen);
+    if (size > 0) {
+        memcpy(buf + plen, data, size);
+    }
+    rv = nng_send(sock, buf, (size_t) plen + size, flags);
+    free(buf);
+    return rv;
+}
+
+/**
+ * @brief Drain pending cumulative ACKs; optionally wait for a target.
+ *
+ * Reads "C<next>" replies until one with next > target arrives (or the
+ * timeout expires). Returns the highest next observed (0 = none).
+ * target = 0 just drains whatever is already queued (non-blocking).
+ */
+static inline uint32_t nng_sack_sync(
+    nng_socket sock, uint32_t target, nng_duration timeout_ms) {
+    uint32_t    best = 0;
+    nng_duration old  = 0;
+    bool         have_old = false;
+    nng_time     deadline = 0;
+    if (timeout_ms > 0) {
+        if (nng_socket_get_ms(
+                sock, NNG_OPT_RECVTIMEO, &old) == 0) {
+            have_old = true;
+        }
+        deadline = nng_clock() + (nng_time) timeout_ms;
+        nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, 50);
+    }
+    for (;;) {
+        char     buf[64];
+        size_t   sz = sizeof(buf) - 1;
+        uint32_t next, mask = 0;
+        int      flags = (timeout_ms > 0) ? 0 : NNG_FLAG_NONBLOCK;
+        int      rv    = nng_recv(sock, buf, &sz, flags);
+        if (rv != 0) {
+            if (timeout_ms > 0 && rv == NNG_ETIMEDOUT &&
+                nng_clock() < deadline) {
+                continue; // short poll slice, overall deadline stands
+            }
+            break;
+        }
+        if (sz >= sizeof(buf)) {
+            sz = sizeof(buf) - 1;
+        }
+        buf[sz] = '\0';
+        next    = nng_sack_parse_next(buf, sz, &mask);
+        if (next > best) {
+            best = next;
+        }
+        if (target != 0 && best > target) {
+            break;
+        }
+        if (timeout_ms > 0 && nng_clock() >= deadline) {
+            break;
+        }
+    }
+    if (have_old) {
+        nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, old);
+    }
+    return best;
+}
+
+// Shared sub-side core: classify seq, maintain cumulative state, decide
+// whether a "C" flush is due. Returns 1 = deliver, 0 = duplicate-drop,
+// and sets *flush when a cumulative ACK must be sent.
+static inline int
+nng_sack_track(nng_socket sock, uint32_t seq, int have_seq, int *flush)
+{
+    struct nng_sack_slot *st = nng_sack_state_for(sock, true);
+
+    *flush = 0;
+    if (!have_seq) {
+        return 1; // legacy body: deliver as-is, no tracking, no ACK change
+    }
+    if (st == NULL) {
+        return 1; // table full: fail open (deliver), no batching
+    }
+    if (st->last != 0 && seq <= st->last) {
+        *flush = 1; // duplicate resend: drop, but fast-ACK now
+        return 0;
+    }
+    if (st->last == 0) {
+        // First seq seen on this socket: adopt as base. (Joining
+        // mid-stream credits older seqs as done; the publisher frees
+        // them. Streaming benchmarks always start at seq 1.)
+        st->last = seq;
+    } else if (seq == st->last + 1) {
+        st->last = seq;
+        // Drain contiguous SACK bits.
+        while ((st->bits & 1u) != 0) {
+            st->last++;
+            st->bits >>= 1;
+        }
+    } else {
+        uint32_t d = seq - st->last - 1;
+        if (d < 16) {
+            st->bits |= (1u << d);
+        }
+        // else beyond mask horizon: deliver, count, pub will resend
+    }
+    st->pending++;
+    if (st->pending >= NNG_SACK_BATCH) {
+        *flush = 1;
+    }
+    return 1;
+}
+
+// Send the current cumulative "C<next>[:mask]" for a socket.
+static inline void
+nng_sack_flush(nng_socket sock)
+{
+    struct nng_sack_slot *st = nng_sack_state_for(sock, false);
+    char                  ack[32];
+    int                   n;
+
+    if (st == NULL || st->last == 0) {
+        return;
+    }
+    if (st->bits != 0) {
+        n = snprintf(ack, sizeof(ack), "C%u:%x", st->last + 1, st->bits);
+    } else {
+        n = snprintf(ack, sizeof(ack), "C%u", st->last + 1);
+    }
+    if (n > 0) {
+        nng_send(sock, ack, (size_t) n + 1, 0);
+    }
+    st->pending = 0;
+}
+
+/**
+ * @brief Wrapper for nng_recvmsg: deliver once, batch ACKs.
+ *
+ * Blocking waits are sliced into NNG_SACK_ACK_DELAY_MS chunks so a
+ * partial tail batch flushes promptly even while no new data arrives.
+ * The socket's NNG_OPT_RECVTIMEO is honored as the overall deadline
+ * (single thread per socket assumed, as in the benchmark).
+ */
+static inline int nng_recvmsg_sack(
+    nng_socket sock, nng_msg **msgp, int flags) {
+    nng_duration tmo      = -1;
+    nng_time     deadline = 0;
+    bool         infinite = true;
+    bool         sliced   = false;
+    bool         nonblock = ((flags & NNG_FLAG_NONBLOCK) != 0);
+    nng_duration saved    = 0;
+    bool         have_saved = false;
+    int          inner    = 0; // inner call flags (0 = blocking slice)
+
+    if (!nonblock) {
+        if (nng_socket_get_ms(sock, NNG_OPT_RECVTIMEO, &tmo) == 0 &&
+            tmo >= 0) {
+            infinite = false;
+            deadline = nng_clock() + (nng_time) tmo;
+        }
+        if (nng_socket_get_ms(sock, NNG_OPT_RECVTIMEO, &saved) == 0) {
+            have_saved = true;
+        }
+        nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, NNG_SACK_ACK_DELAY_MS);
+        sliced = true;
+    } else {
+        inner = NNG_FLAG_NONBLOCK;
+    }
+    for (;;) {
+        nng_msg *m   = NULL;
+        int      rv  = nng_recvmsg(sock, &m, inner);
+        uint32_t seq = 0;
+        int      pre = 0;
+        int      flush = 0;
+        int      keep;
+        if (rv == NNG_ETIMEDOUT && sliced) {
+            struct nng_sack_slot *st =
+                nng_sack_state_for(sock, false);
+            if (st != NULL && st->pending > 0) {
+                nng_sack_flush(sock); // tail: partial batch, send it now
+            }
+            if (!infinite && nng_clock() >= deadline) {
+                if (have_saved) {
+                    nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, saved);
+                }
+                return NNG_ETIMEDOUT;
+            }
+            continue;
+        }
+        if (rv != 0) {
+            if (sliced && have_saved) {
+                nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, saved);
+            }
+            return rv;
+        }
+        pre = nng_sack_split_seq(
+            (const char *) nng_msg_body(m), nng_msg_len(m), &seq);
+        keep = nng_sack_track(sock, seq, pre > 0, &flush);
+        if (!keep) {
+            nng_sack_flush(sock); // dup: feed publisher's books now
+            nng_msg_free(m);
+            continue;
+        }
+        if (pre > 0) {
+            nng_msg_trim(m, (size_t) pre);
+        }
+        if (flush) {
+            nng_sack_flush(sock);
+        }
+        if (sliced && have_saved) {
+            nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, saved);
+        }
+        *msgp = m;
+        return 0;
+    }
+}
+
+/**
+ * @brief Wrapper for nng_recv: deliver once, batch ACKs (same slicing).
+ */
+static inline int nng_recv_sack(
+    nng_socket sock, void *data, size_t *sizep, int flags) {
+    nng_duration tmo      = -1;
+    nng_time     deadline = 0;
+    bool         infinite = true;
+    bool         sliced   = false;
+    bool         nonblock = ((flags & NNG_FLAG_NONBLOCK) != 0);
+    nng_duration saved    = 0;
+    bool         have_saved = false;
+    int          inner    = 0;
+
+    if (!nonblock) {
+        if (nng_socket_get_ms(sock, NNG_OPT_RECVTIMEO, &tmo) == 0 &&
+            tmo >= 0) {
+            infinite = false;
+            deadline = nng_clock() + (nng_time) tmo;
+        }
+        if (nng_socket_get_ms(sock, NNG_OPT_RECVTIMEO, &saved) == 0) {
+            have_saved = true;
+        }
+        nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, NNG_SACK_ACK_DELAY_MS);
+        sliced = true;
+    } else {
+        inner = NNG_FLAG_NONBLOCK;
+    }
+    for (;;) {
+        char    *buf = (char *) data;
+        size_t   cap = *sizep;
+        int      rv  = nng_recv(sock, data, sizep, inner);
+        uint32_t seq = 0;
+        int      pre = 0;
+        int      flush = 0;
+        int      keep;
+        if (rv == NNG_ETIMEDOUT && sliced) {
+            struct nng_sack_slot *st =
+                nng_sack_state_for(sock, false);
+            if (st != NULL && st->pending > 0) {
+                nng_sack_flush(sock);
+            }
+            if (!infinite && nng_clock() >= deadline) {
+                if (have_saved) {
+                    nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, saved);
+                }
+                *sizep = 0;
+                return NNG_ETIMEDOUT;
+            }
+            *sizep = cap;
+            continue;
+        }
+        if (rv != 0) {
+            if (sliced && have_saved) {
+                nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, saved);
+            }
+            return rv;
+        }
+        pre  = nng_sack_split_seq(buf, *sizep, &seq);
+        keep = nng_sack_track(sock, seq, pre > 0, &flush);
+        if (!keep) {
+            nng_sack_flush(sock);
+            *sizep = cap;
+            continue;
+        }
+        if (pre > 0) {
+            memmove(buf, buf + pre, *sizep - (size_t) pre);
+            *sizep -= (size_t) pre;
+        }
+        if (flush) {
+            nng_sack_flush(sock);
+        }
+        if (sliced && have_saved) {
+            nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, saved);
+        }
+        return 0;
+    }
+}
+
+#endif // NNG_PUBSUB_SACK
 
 // Override pub/sub functions with the selected bridge.
 // Must stay after all definitions above (see NOTE at top).
-// Survey mode wins if both flags are (mistakenly) defined.
-#if defined(NNG_PUBSUB_SURVEY)
+// SACK mode wins if several flags are (mistakenly) defined.
+#if defined(NNG_PUBSUB_SACK)
+#define nng_pub0_open nng_pub0_open_sack
+#define nng_sub0_open nng_sub0_open_sack
+#define nng_send nng_send_sack
+#define nng_recvmsg nng_recvmsg_sack
+#define nng_recv nng_recv_sack
+#elif defined(NNG_PUBSUB_SURVEY)
 #define nng_pub0_open nng_pub0_open_survey
 #define nng_sub0_open nng_sub0_open_survey
 #define nng_send nng_send_survey
@@ -379,6 +841,6 @@ static inline int nng_recv_reliable(nng_socket sock, void *data, size_t *sizep, 
 #define nng_recv nng_recv_reliable
 #endif
 
-#endif // NNG_PUBSUB_SURVEY || NNG_PUBSUB_RELIABLE
+#endif // NNG_PUBSUB_SURVEY || NNG_PUBSUB_RELIABLE || NNG_PUBSUB_SACK
 
 #endif // NNG_WRAPPER_H

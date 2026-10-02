@@ -1725,6 +1725,14 @@ NNG_DECL int nng_surveyor0_open_raw(nng_socket *);
 #define NNG_OPT_SURVEYOR_RTO        "surveyor:rto"
 #define NNG_OPT_SURVEYOR_CWND       "surveyor:cwnd"
 
+// SURVEYACK0 (cumulative-ACK RTT-lite broadcast, window SACK0_RING_MAX)
+NNG_DECL int nng_sackresp0_open(nng_socket *);
+NNG_DECL int nng_sack0_open(nng_socket *);
+#define NNG_OPT_SACK_SURVEYTIME "sack:survey-time"
+#define NNG_OPT_SACK_ADAPTIVE   "sack:adaptive"
+#define NNG_OPT_SACK_RTO        "sack:rto"
+#define NNG_OPT_SACK_CWND       "sack:cwnd"
+
 // These transition macros may help with migration from NNG1.
 // Applications should try to avoid depending on these any longer than
 // necessary, as they may be removed in a future update.  This is far from a

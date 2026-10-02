@@ -17,4 +17,5 @@ add_subdirectory(pipeline0)
 add_subdirectory(pubsub0)
 add_subdirectory(reqrep0)
 add_subdirectory(survey0)
+add_subdirectory(surveyack0)
 
