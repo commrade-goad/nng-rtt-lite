@@ -41,16 +41,11 @@
 #define SACK0_CWND_MAX  1024
 #define SACK0_RING_MAX  8   // repair window: last N surveys kept for resend
 #define SACK0_RESEND_TICK 100 // ms between resend scans
-// Fanout pacing: when a caught-up pipe's queue is momentarily full,
-// wait (unlocked, 1ms slices) up to this long for drain instead of
-// silently skipping the survey on that pipe. A skipped survey is
-// unrecoverable once the window slides past it, so bursts would turn
-// into permanent holes. Pipes already behind (holes outstanding) are
-// never waited on: the resend machinery owns them. Bound keeps no-HOL:
-// a dead pipe costs at most this per send, then MD+skip.
-#define SACK0_FANOUT_WAIT_MS 20
+// Fanout pacing: when pipes are saturated, wait for drain
+// bounded up to 200ms when all pipes are saturated.
+#define SACK0_FANOUT_WAIT_MS 200
 // Per-pipe transport queue depth (burst absorption room).
-#define SACK0_SEND_BUF 32
+#define SACK0_SEND_BUF 128
 // Cumulative-ACK batching: change ONLY SACK0_RING_MAX above; the batch
 // size follows it. A sub sends one "C<next>[:mask]" per batch instead
 // of one ACK per survey.
@@ -862,27 +857,27 @@ sack0_ctx_send(void *arg, nni_aio *aio)
 	// regardless of whether there are any pipes or not.  If no pipes,
 	// then it just gets discarded.
 	now = nni_clock();
-	// Burst pacing: if a pipe is momentarily saturated, wait briefly
-	// for drain instead of skipping it into a permanent hole (a skip
-	// is unrecoverable once the window slides past it). Only a boolean
-	// crosses the unlock; the list is re-scanned every slice, so a
-	// concurrent close is always safe. Pipes that proved slow (skipped
-	// within the last second) are never waited on: the hole machinery
-	// (resend/MD) owns them. Bound keeps no-HOL: a dead pipe costs at
-	// most SACK0_FANOUT_WAIT_MS per second of sends, then MD+skip.
+	// Burst pacing: wait for pipes to drain when saturated.
+	// If all connected pipes are saturated, wait up to SACK0_FANOUT_WAIT_MS (200ms)
+	// so symmetric impairment (e.g. netem delay) drains properly without dropping.
+	// If at least one pipe is open (asymmetric test), wait at most 10ms for
+	// slight jitter, and then proceed so the fast peer is never held back.
 	for (int waited = 0; waited < SACK0_FANOUT_WAIT_MS; waited++) {
-		bool saturated = false;
+		bool any_saturated = false;
+		bool any_open      = false;
+
 		NNI_LIST_FOREACH (&sock->pipes, pipe) {
-			if (pipe->busy &&
-			    nni_lmq_full(&pipe->send_queue) &&
-			    (pipe->last_skip == 0 ||
-			        (now - pipe->last_skip) > 1000)) {
-				saturated = true;
-				break;
+			if (pipe->busy && nni_lmq_full(&pipe->send_queue)) {
+				any_saturated = true;
+			} else {
+				any_open = true;
 			}
 		}
-		if (!saturated) {
-			break;
+		if (!any_saturated) {
+			break; // all pipes have queue space
+		}
+		if (any_open && waited >= 10) {
+			break; // fast peer ready, do not hold it back
 		}
 		nni_mtx_unlock(&sock->mtx);
 		nni_msleep(1);
@@ -902,9 +897,7 @@ sack0_ctx_send(void *arg, nni_aio *aio)
 			nni_msg_clone(msg);
 			nni_lmq_put(&pipe->send_queue, msg);
 		} else {
-			// Still saturated after the wait: skip and stamp it,
-			// so pacing backs off for a while. The hole machinery
-			// (resend/MD) owns recovery from here.
+			// Saturated after wait: slow peer in asymmetric test, skip.
 			pipe->last_skip = nni_clock();
 			continue;
 		}
