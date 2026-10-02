@@ -41,6 +41,16 @@
 #define SACK0_CWND_MAX  1024
 #define SACK0_RING_MAX  8   // repair window: last N surveys kept for resend
 #define SACK0_RESEND_TICK 100 // ms between resend scans
+// Fanout pacing: when a caught-up pipe's queue is momentarily full,
+// wait (unlocked, 1ms slices) up to this long for drain instead of
+// silently skipping the survey on that pipe. A skipped survey is
+// unrecoverable once the window slides past it, so bursts would turn
+// into permanent holes. Pipes already behind (holes outstanding) are
+// never waited on: the resend machinery owns them. Bound keeps no-HOL:
+// a dead pipe costs at most this per send, then MD+skip.
+#define SACK0_FANOUT_WAIT_MS 20
+// Per-pipe transport queue depth (burst absorption room).
+#define SACK0_SEND_BUF 32
 // Cumulative-ACK batching: change ONLY SACK0_RING_MAX above; the batch
 // size follows it. A sub sends one "C<next>[:mask]" per batch instead
 // of one ACK per survey.
@@ -150,6 +160,9 @@ struct sack0_pipe {
 	uint32_t ack_mask;
 	// Last resend pass to this pipe (bounds repeats to ~1 per RTO).
 	nni_time last_resend;
+	// Last fanout skip on this pipe (proves it slow: skip the pacing
+	// wait for a while so one dead pipe can't tax every send).
+	nni_time last_skip;
 };
 
 // Clamp RTO to [RTO_MIN, RTO_MAX].
@@ -849,6 +862,33 @@ sack0_ctx_send(void *arg, nni_aio *aio)
 	// regardless of whether there are any pipes or not.  If no pipes,
 	// then it just gets discarded.
 	now = nni_clock();
+	// Burst pacing: if a pipe is momentarily saturated, wait briefly
+	// for drain instead of skipping it into a permanent hole (a skip
+	// is unrecoverable once the window slides past it). Only a boolean
+	// crosses the unlock; the list is re-scanned every slice, so a
+	// concurrent close is always safe. Pipes that proved slow (skipped
+	// within the last second) are never waited on: the hole machinery
+	// (resend/MD) owns them. Bound keeps no-HOL: a dead pipe costs at
+	// most SACK0_FANOUT_WAIT_MS per second of sends, then MD+skip.
+	for (int waited = 0; waited < SACK0_FANOUT_WAIT_MS; waited++) {
+		bool saturated = false;
+		NNI_LIST_FOREACH (&sock->pipes, pipe) {
+			if (pipe->busy &&
+			    nni_lmq_full(&pipe->send_queue) &&
+			    (pipe->last_skip == 0 ||
+			        (now - pipe->last_skip) > 1000)) {
+				saturated = true;
+				break;
+			}
+		}
+		if (!saturated) {
+			break;
+		}
+		nni_mtx_unlock(&sock->mtx);
+		nni_msleep(1);
+		nni_mtx_lock(&sock->mtx);
+		now = nni_clock();
+	}
 	nni_aio_set_msg(aio, NULL);
 	NNI_LIST_FOREACH (&sock->pipes, pipe) {
 
@@ -862,6 +902,10 @@ sack0_ctx_send(void *arg, nni_aio *aio)
 			nni_msg_clone(msg);
 			nni_lmq_put(&pipe->send_queue, msg);
 		} else {
+			// Still saturated after the wait: skip and stamp it,
+			// so pacing backs off for a while. The hole machinery
+			// (resend/MD) owns recovery from here.
+			pipe->last_skip = nni_clock();
 			continue;
 		}
 	}
@@ -950,7 +994,7 @@ sack0_sock_init(void *arg, nni_sock *s)
 	// to increase this if many contexts will want to publish
 	// at nearly the same time.
 	nni_atomic_init(&sock->send_buf);
-	nni_atomic_set(&sock->send_buf, 8);
+	nni_atomic_set(&sock->send_buf, SACK0_SEND_BUF);
 
 	// Survey IDs are 32 bits, with the high order bit set.
 	// We start at a random point, to minimize likelihood of
@@ -1049,6 +1093,7 @@ sack0_pipe_init(void *arg, nni_pipe *pipe, void *s)
 	p->ack_base    = 0;
 	p->ack_mask    = 0;
 	p->last_resend = 0;
+	p->last_skip   = 0;
 	return (0);
 }
 
@@ -1097,6 +1142,7 @@ sack0_pipe_close(void *arg)
 	p->ack_base    = 0;
 	p->ack_mask    = 0;
 	p->last_resend = 0;
+	p->last_skip   = 0;
 	nni_mtx_unlock(&s->mtx);
 }
 

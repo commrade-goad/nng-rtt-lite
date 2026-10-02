@@ -33,6 +33,8 @@ sub missed 6    -> replies "C9" later / "C6:mask" now -> pub resends only 6
 #define SACK0_RTO_INIT 3000 / MIN 200 / MAX 60000 / AI_STEP 100
 #define SACK0_CWND_INIT 1 / MIN 1 / MAX 1024
 #define SACK0_RESEND_TICK 100
+#define SACK0_FANOUT_WAIT_MS 20 // max pacing wait per send (no-HOL bound)
+#define SACK0_SEND_BUF 32       // per-pipe transport queue depth
 ```
 
 Wrapper batch/delay (`nng_wrapper.h`): `NNG_SACK_BATCH 8`,
@@ -79,6 +81,13 @@ Old `survey0` untouched, all its tests still pass.
   survey, keeps up to 8 live. Full window evicts oldest (MD only if that
   slot is genuinely older than the pipe's RTO, so healthy streaming never
   punishes). Parses `<wseq>|` into `ring_wseq[]`.
+- **Fanout pacing (blast survival)**: a saturated pipe used to be
+  silently skipped, and the skip became permanent once the window slid
+  past it (measured: ~79/1000 dropped on a TCP loopback blast). Now a
+  caught-up pipe gets a bounded wait (1 ms slices, ≤20 ms) for drain
+  before a skip; pipes that proved slow (skipped <1 s ago) are never
+  waited on, so one dead pipe can't tax every send. Queue depth is 32.
+  Verified: 1000/1000 x3 on the same blast (plain `std` gets 999/1000).
 - **Scoreboard (per pipe)**: `ack_base` (next seq owed) + 16-bit `ack_mask`.
   `sack0_advance_pipe()` grows it, samples RTT off the oldest newly-acked
   slot (skipped if any covered slot was resent: Karn), `cwnd++` (AI).
