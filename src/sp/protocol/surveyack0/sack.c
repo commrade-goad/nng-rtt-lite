@@ -835,8 +835,59 @@ sack0_ctx_send(void *arg, nni_aio *aio)
 
 	// Adaptive windowed path: up to SACK0_RING_MAX surveys live at once,
 	// no abort. A full window evicts the oldest (MD for laggards).
+	//
+	// RTT-lite gating: bound live slots by the trained congestion window
+	// (cwnd), not a constant window. cwnd starts at 1, AI on each
+	// pipe-ACK, MD on replies lost to deadline/RTO. This restores the
+	// in-flight cap that gives bounded latency under netem; without it
+	// the pipelined window behaves like plain pub/sub's firehose.
+	{
+		int live_limit = (int) sock->cwnd;
+		if (live_limit < SACK0_CWND_MIN) {
+			live_limit = SACK0_CWND_MIN;
+		}
+		if (live_limit > SACK0_RING_MAX) {
+			live_limit = SACK0_RING_MAX;
+		}
+		if (sack0_live_count(sock) >= live_limit) {
+			nni_duration budget = survey_time;
+			if (budget <= 0) {
+				budget = SACK0_RESEND_TICK;
+			}
+			for (nni_duration waited = 0; waited < budget;
+			    waited++) {
+				if (sack0_live_count(sock) < live_limit) {
+					break;
+				}
+				if (nni_aio_result(aio) != 0) {
+					break;
+				}
+				nni_mtx_unlock(&sock->mtx);
+				nni_msleep(1);
+				nni_mtx_lock(&sock->mtx);
+			}
+		}
+	}
 	if (sack0_live_count(sock) >= SACK0_RING_MAX) {
 		sack0_evict_oldest(sock);
+	} else if (sack0_live_count(sock) >= (int) sock->cwnd &&
+    (int) sock->cwnd < SACK0_RING_MAX) {
+		// Backlog smaller than SACK0_RING_MAX but still beyond the
+		// trained window: force-slide the oldest so the stream makes
+		// forward progress even when ACKs stop for one deadline.
+		for (nni_duration waited = 0; waited < (nni_duration)
+		    (survey_time > 0 ? survey_time : SACK0_RESEND_TICK); waited++) {
+			if (sack0_live_count(sock) < (int) sock->cwnd) {
+				break;
+			}
+			nni_mtx_unlock(&sock->mtx);
+			nni_msleep(1);
+			nni_mtx_lock(&sock->mtx);
+		}
+		if (sack0_live_count(sock) >= (int) sock->cwnd &&
+		    (int) sock->cwnd < SACK0_RING_MAX) {
+			sack0_evict_oldest(sock);
+		}
 	}
 
 	// Allocate the new ID.

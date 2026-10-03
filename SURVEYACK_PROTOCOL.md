@@ -33,8 +33,8 @@ sub missed 6    -> replies "C9" later / "C6:mask" now -> pub resends only 6
 #define SACK0_RTO_INIT 3000 / MIN 200 / MAX 60000 / AI_STEP 100
 #define SACK0_CWND_INIT 1 / MIN 1 / MAX 1024
 #define SACK0_RESEND_TICK 100
-#define SACK0_FANOUT_WAIT_MS 20 // max pacing wait per send (no-HOL bound)
-#define SACK0_SEND_BUF 32       // per-pipe transport queue depth
+#define SACK0_FANOUT_WAIT_MS 200   // max pacing wait per send (no-HOL bound)
+#define SACK0_SEND_BUF 128         // per-pipe transport queue depth
 ```
 
 Wrapper batch/delay (`nng_wrapper.h`): `NNG_SACK_BATCH 8`,
@@ -81,20 +81,28 @@ Old `survey0` untouched, all its tests still pass.
   survey, keeps up to 8 live. Full window evicts oldest (MD only if that
   slot is genuinely older than the pipe's RTO, so healthy streaming never
   punishes). Parses `<wseq>|` into `ring_wseq[]`.
-- **Fanout pacing (blast survival)**: a saturated pipe used to be
-  silently skipped, and the skip became permanent once the window slid
-  past it (measured: ~79/1000 dropped on a TCP loopback blast). Now a
-  caught-up pipe gets a bounded wait (1 ms slices, ≤20 ms) for drain
-  before a skip; pipes that proved slow (skipped <1 s ago) are never
-  waited on, so one dead pipe can't tax every send. Queue depth is 32.
-  Verified: 1000/1000 x3 on the same blast (plain `std` gets 999/1000).
+- **Live-window gating (NEW)**: the adaptive path also caps the number of
+  live slots with `min(sock->cwnd, SACK0_RING_MAX)`. If `live_count()
+  >= live_limit`, the sender blocks (1 ms slices) until a slot frees or
+  `survey_time` elapses. This restores the "cwnd-adaptive" property of
+  SACK: on clean transport the window rises 1->2->3.. up to 8 via the
+  usual AI in `sack0_advance_pipe()`, and each missed pipe resets the
+  sender's `cwnd` to 1 via MD. Goodputs enough to avoid blast-buffering
+  on real workloads; badputs slow down instead of flooding.
+- **Burst pacing**: after the cwnd gate, the sender still waits boundedly
+  up to SACK0_FANOUT_WAIT_MS when every pipe is saturated, and up to 10 ms
+  when only one pipe is slow, so the fastest peer is never held by the
+  slowest. Slow pipes (skipped <1 s ago) are never held back; one dead
+  pipe cannot tax every send. Queue depth is SACK0_SEND_BUF (128).
 - **Scoreboard (per pipe)**: `ack_base` (next seq owed) + 16-bit `ack_mask`.
   `sack0_advance_pipe()` grows it, samples RTT off the oldest newly-acked
   slot (skipped if any covered slot was resent: Karn), `cwnd++` (AI).
 - **Freeing**: `sack0_collect_acked()` frees slots every pipe acked.
   Unacked past deadline are reaped by the resend timer (MD once, free).
   Recv timeouts/cancels end only that wait, never the window (a NONBLOCK
-  probe on an empty-but-live window used to nuke it; fixed).
+  probe on an empty-but-live window used to nuke it; fixed). MD is also
+  applied by `sack0_evict_oldest()` when a window slot is forced out while
+  any lagging pipe is older than its RTO.
 - **Resend (`sack0_resend_cb`)**: per-pipe holes only (skips SACK bits),
   ~1 pass per RTO per pipe (`last_resend` gate), holes past 2xRTO also
   decay (MD, once per pass) but stay resendable.
@@ -136,11 +144,22 @@ Tail at stream end: sub calls `nng_sack_flush(sub)` after its last recv
 - E2E (inproc, wrapper): 10 pipelined sends -> 10 intact in-order recvs,
   2 uplink ACKs (`C9`, `C11`), `cwnd` 1->3, RTO trains.
 - Benchmark smoke: `40/40` msgs, 2 subs, inproc, SACK binary.
+- Inproc gating smoke (2 sub, 2000x1000): std avg ~29us, SACK avg ~208us,
+  SACK IPC drops to ~4.0k msg/s — the cwnd gate visibly rate-limits
+  instead of free-running. At `netem delay 10ms loss 1%`, transient
+  Block B indicates SACK throttles more deliberately than std (avg latency
+  ~10ms like std but throughput drops along with compensated pacing).
 
 ## Limits (same family as before, documented)
 
 - Horizon 8: a hole unacked past eviction+deadline is dropped with one MD.
   Late joiners get replay of unacked slots via resend (their base is 0).
-- Window slides without waiting for the slowest; laggards get hole
-  resends + MD, not head-of-line blocking.
+- Window still slides without waiting for the slowest; laggards get hole
+  resends + MD, not head-of-line blocking. No strict quorum/deadline
+  abort (that semantics lives in survey0), so asymmetric loss tests show
+  no sudden death of the publisher; throughput degrades instead.
+- The adaptiveness relies on trained RTO/cwnd; during the training phase
+  (first few sends, RTO still at 3000 ms) the fanout can look like raw
+  TCP pacing. Once RTT samples arrive, the live-window shrinks to cwnd
+  and latency picks up the the expected burst/normal boundary.
 - One thread per sub socket assumed (wrapper slices RECVTIMEO).
