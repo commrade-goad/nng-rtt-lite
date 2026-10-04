@@ -396,6 +396,12 @@ struct nng_sack_slot {
 };
 static struct nng_sack_slot nng_sack_seen[NNG_SACK_SLOTS] = { { 0 } };
 
+// Flush telemetry: how many cumulative ACKs actually left the socket
+// vs failed to send. Read them after a run to tell "C never sent"
+// apart from "C sent but lost/unprocessed". Zero behavior change.
+static unsigned long nng_sack_flush_sent   = 0;
+static unsigned long nng_sack_flush_failed = 0;
+
 static inline struct nng_sack_slot *
 nng_sack_state_for(nng_socket sock, bool create)
 {
@@ -487,6 +493,58 @@ nng_sack_parse_next(const char *body, size_t len, uint32_t *maskp)
     return v;
 }
 
+// Publisher socket registry (SACK teardown needs the role: only pub
+// sockets drain final ACKs via nng_sack_sync, sub sockets just flush
+// their tail batch. Same tiny-table pattern as nng_sack_seen; benchmark
+// scale, one pub per process).
+#define NNG_SACK_PUB_SLOTS 16
+static struct {
+    bool used;
+    int  sock_id;
+} nng_sack_pubs[NNG_SACK_PUB_SLOTS] = { { 0 } };
+
+static inline void
+nng_sack_pub_remember(nng_socket sock)
+{
+    int id = nng_socket_id(sock);
+    for (int i = 0; i < NNG_SACK_PUB_SLOTS; i++) {
+        if (nng_sack_pubs[i].used && nng_sack_pubs[i].sock_id == id) {
+            return;
+        }
+    }
+    for (int i = 0; i < NNG_SACK_PUB_SLOTS; i++) {
+        if (!nng_sack_pubs[i].used) {
+            nng_sack_pubs[i].used    = true;
+            nng_sack_pubs[i].sock_id = id;
+            return;
+        }
+    }
+}
+
+static inline bool
+nng_sack_is_pub(nng_socket sock)
+{
+    int id = nng_socket_id(sock);
+    for (int i = 0; i < NNG_SACK_PUB_SLOTS; i++) {
+        if (nng_sack_pubs[i].used && nng_sack_pubs[i].sock_id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline void
+nng_sack_pub_forget(nng_socket sock)
+{
+    int id = nng_socket_id(sock);
+    for (int i = 0; i < NNG_SACK_PUB_SLOTS; i++) {
+        if (nng_sack_pubs[i].used && nng_sack_pubs[i].sock_id == id) {
+            nng_sack_pubs[i].used = false;
+            return;
+        }
+    }
+}
+
 /**
  * @brief Wrapper for nng_pub0_open that redirects to sack.
  */
@@ -496,6 +554,7 @@ static inline int nng_pub0_open_sack(nng_socket *sock) {
         nng_socket_set_ms(
             *sock, NNG_OPT_SACK_SURVEYTIME, nng_sack_deadline_ms);
         nng_socket_set_bool(*sock, NNG_OPT_SACK_ADAPTIVE, true);
+        nng_sack_pub_remember(*sock);
     }
     return rv;
 }
@@ -640,6 +699,7 @@ nng_sack_flush(nng_socket sock)
     struct nng_sack_slot *st = nng_sack_state_for(sock, false);
     char                  ack[32];
     int                   n;
+    int                   rv;
 
     if (st == NULL || st->last == 0) {
         return;
@@ -650,7 +710,14 @@ nng_sack_flush(nng_socket sock)
         n = snprintf(ack, sizeof(ack), "C%u", st->last + 1);
     }
     if (n > 0) {
-        nng_send(sock, ack, (size_t) n + 1, 0);
+        rv = nng_send(sock, ack, (size_t) n + 1, 0);
+        if (rv == 0) {
+            nng_sack_flush_sent++;
+        } else {
+            nng_sack_flush_failed++;
+            fprintf(stderr, "sack: flush send failed: %s\n",
+                nng_strerror(rv));
+        }
     }
     st->pending = 0;
 }
@@ -673,6 +740,7 @@ static inline int nng_recvmsg_sack(
     nng_duration saved    = 0;
     bool         have_saved = false;
     int          inner    = 0; // inner call flags (0 = blocking slice)
+    int          first    = 1; // first pass probes nonblocking (below)
 
     if (!nonblock) {
         if (nng_socket_get_ms(sock, NNG_OPT_RECVTIMEO, &tmo) == 0 &&
@@ -690,11 +758,26 @@ static inline int nng_recvmsg_sack(
     }
     for (;;) {
         nng_msg *m   = NULL;
-        int      rv  = nng_recvmsg(sock, &m, inner);
+        int      rv  = nng_recvmsg(sock, &m,
+            (!nonblock && first) ? (int) NNG_FLAG_NONBLOCK : inner);
         uint32_t seq = 0;
         int      pre = 0;
         int      flush = 0;
         int      keep;
+        first = 0;
+        if (rv == NNG_EAGAIN && !nonblock) {
+            // Probe miss in blocking mode: nothing ready right now.
+            // Flush pending first so a starved publisher unblocks now
+            // instead of at the next 50 ms slice, then fall into the
+            // normal blocking slices below. At most one extra flush
+            // per call; streaming (queue non-empty) never takes it.
+            struct nng_sack_slot *pst =
+                nng_sack_state_for(sock, false);
+            if (pst != NULL && pst->pending > 0) {
+                nng_sack_flush(sock);
+            }
+            continue;
+        }
         if (rv == NNG_ETIMEDOUT && sliced) {
             struct nng_sack_slot *st =
                 nng_sack_state_for(sock, false);
@@ -750,6 +833,7 @@ static inline int nng_recv_sack(
     nng_duration saved    = 0;
     bool         have_saved = false;
     int          inner    = 0;
+    int          first    = 1; // first pass probes nonblocking (below)
 
     if (!nonblock) {
         if (nng_socket_get_ms(sock, NNG_OPT_RECVTIMEO, &tmo) == 0 &&
@@ -768,11 +852,23 @@ static inline int nng_recv_sack(
     for (;;) {
         char    *buf = (char *) data;
         size_t   cap = *sizep;
-        int      rv  = nng_recv(sock, data, sizep, inner);
+        int      rv  = nng_recv(sock, data, sizep,
+            (!nonblock && first) ? (int) NNG_FLAG_NONBLOCK : inner);
         uint32_t seq = 0;
         int      pre = 0;
         int      flush = 0;
         int      keep;
+        first = 0;
+        if (rv == NNG_EAGAIN && !nonblock) {
+            // Probe miss in blocking mode: see nng_recvmsg_sack.
+            struct nng_sack_slot *pst =
+                nng_sack_state_for(sock, false);
+            if (pst != NULL && pst->pending > 0) {
+                nng_sack_flush(sock);
+            }
+            *sizep = cap;
+            continue;
+        }
         if (rv == NNG_ETIMEDOUT && sliced) {
             struct nng_sack_slot *st =
                 nng_sack_state_for(sock, false);
