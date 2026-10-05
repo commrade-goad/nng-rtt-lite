@@ -673,7 +673,12 @@ nng_sack_track(nng_socket sock, uint32_t seq, int have_seq, int *flush)
         st->last = seq;
     } else if (seq == st->last + 1) {
         st->last = seq;
-        // Drain contiguous SACK bits.
+        // Consume the bit position of the newly contiguous seq first:
+        // bit0 always described (old) last+1, which just arrived, so it
+        // must not survive the base advance. Then drain any further
+        // contiguous SACK bits. Without this shift the mask goes stale
+        // by one (claims the next seq missing and a future seq present).
+        st->bits >>= 1;
         while ((st->bits & 1u) != 0) {
             st->last++;
             st->bits >>= 1;
