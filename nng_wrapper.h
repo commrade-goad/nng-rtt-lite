@@ -366,7 +366,7 @@ static inline int nng_recv_reliable(nng_socket sock, void *data, size_t *sizep, 
 #if defined(NNG_PUBSUB_SACK)
 
 // Cumulative-ACK bridge over the sack/sackresp protocol: the publisher
-// pipelines surveys WITHOUT waiting (window SACK0_RING_MAX = 8, one
+// pipelines surveys WITHOUT waiting (window SACK0_RING_MAX = 32, one
 // #define in sack.c), and each subscriber answers once per batch with
 // "C<next>[:mask]" ("everything below <next> done, plus SACK bits").
 // 10 msgs cost ~2 uplink ACKs instead of 10. RTT-lite AIMD lives in
@@ -377,7 +377,7 @@ static nng_duration nng_sack_deadline_ms = 2000;
 static uint32_t     nng_sack_seq_next    = 1; // pub side; one pub thread
 
 // Batch + delayed-ACK tunables. NNG_SACK_BATCH must stay <= the
-// protocol window SACK0_RING_MAX (8, one #define in sack.c): one
+// protocol window SACK0_RING_MAX (32, one #define in sack.c): one
 // cumulative per batch. NNG_SACK_ACK_DELAY_MS bounds tail latency:
 // a partial batch flushes at most this long after it stopped growing,
 // even while the app is blocked in nng_recv.
