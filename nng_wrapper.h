@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
+// Single-knob scale S: subscriber ACK batch follows the protocol repair
+// window (needs -I<nng-src>; bml Makefile passes the same -DSACK0_RING_MAX
+// as the lib build — keep both flags identical per experiment).
+#include "src/sp/protocol/surveyack0/sack_params.h"
 
 // NOTE on macros: the alias #defines live at the BOTTOM of this header,
 // after every function body. They are object-like macros
@@ -366,25 +370,24 @@ static inline int nng_recv_reliable(nng_socket sock, void *data, size_t *sizep, 
 #if defined(NNG_PUBSUB_SACK)
 
 // Cumulative-ACK bridge over the sack/sackresp protocol: the publisher
-// pipelines surveys WITHOUT waiting (window SACK0_RING_MAX = 32, one
-// #define in sack.c), and each subscriber answers once per batch with
+// pipelines surveys WITHOUT waiting (window SACK0_RING_MAX, single knob
+// in sack_params.h), and each subscriber answers once per batch with
 // "C<next>[:mask]" ("everything below <next> done, plus SACK bits").
-// 10 msgs cost ~2 uplink ACKs instead of 10. RTT-lite AIMD lives in
+// 10 msgs cost a fraction of that in uplink ACKs instead of 10. RTT-lite AIMD lives in
 // sack.c and is enabled here. All subscribers get everything: the
 // publisher resends per-pipe holes until each pipe cumulatively acks.
 
 static nng_duration nng_sack_deadline_ms = 2000;
 static uint32_t     nng_sack_seq_next    = 1; // pub side; one pub thread
 
-// Batch + delayed-ACK tunables. NNG_SACK_BATCH must stay <= the
-// protocol window SACK0_RING_MAX (32, one #define in sack.c): one
-// cumulative per batch. NNG_SACK_ACK_DELAY_MS bounds tail latency:
-// a partial batch flushes at most this long after it stopped growing,
-// even while the app is blocked in nng_recv.
-#define NNG_SACK_BATCH 8
+// Batch + delayed-ACK tunables. The batch IS the ring: one cumulative
+// per SACK0_RING_MAX sends (see sack_params.h). NNG_SACK_ACK_DELAY_MS
+// bounds tail latency: a partial batch flushes at most this long after
+// it stopped growing, even while the app is blocked in nng_recv.
+#define NNG_SACK_BATCH SACK0_RING_MAX
 #define NNG_SACK_ACK_DELAY_MS 50
 // Per-subscriber cumulative state: last = highest contiguous wrapper
-// seq delivered, bits = SACK for last+1..last+16 (LSB = last+1),
+// seq delivered, bits = SACK for last+1..last+SACK_BITS (LSB = last+1),
 // pending = new deliveries since the last flushed C.
 #define NNG_SACK_SLOTS 16
 struct nng_sack_slot {
@@ -685,7 +688,7 @@ nng_sack_track(nng_socket sock, uint32_t seq, int have_seq, int *flush)
         }
     } else {
         uint32_t d = seq - st->last - 1;
-        if (d < 16) {
+        if (d < SACK0_SACK_BITS) {
             st->bits |= (1u << d);
         }
         // else beyond mask horizon: deliver, count, pub will resend

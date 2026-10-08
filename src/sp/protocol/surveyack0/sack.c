@@ -30,27 +30,23 @@
 #define SACK0_SELF_NAME "sack"
 #define SACK0_PEER_NAME "sackresp"
 
+#include "sack_params.h"
+
 // Cumulative-ACK RTT-lite broadcast (cloned from surveyor0).
-// Window + repair buffer size: change in ONE place via this #define.
+// Window + repair buffer size: single knob SACK0_RING_MAX (see sack_params.h).
 #define SACK0_RTO_INIT 3000   // ms
 #define SACK0_RTO_MIN  200    // ms
 #define SACK0_RTO_MAX  60000  // ms
 #define SACK0_AI_STEP  100    // ms additive increase bias
 #define SACK0_CWND_INIT 1
 #define SACK0_CWND_MIN  1
-#define SACK0_CWND_MAX  1024
-#define SACK0_RING_MAX  32  // repair window: last N surveys kept for resend
+#define SACK0_CWND_MAX 1024
 #define SACK0_RESEND_TICK 100 // ms between resend scans
 // Fanout pacing: when pipes are saturated, wait for drain
 // bounded up to 200ms when all pipes are saturated.
 #define SACK0_FANOUT_WAIT_MS 200
 // Per-pipe transport queue depth (burst absorption room).
 #define SACK0_SEND_BUF 128
-// Cumulative-ACK batching: change ONLY SACK0_RING_MAX above; the batch
-// size follows it. A sub sends one "C<next>[:mask]" per batch instead
-// of one ACK per survey.
-#define SACK0_ACK_BATCH SACK0_RING_MAX
-#define SACK0_SACK_BITS 16 // SACK mask covers next 16 wrapper seqs above base
 
 typedef struct sack0_pipe sack0_pipe;
 typedef struct sack0_sock sack0_sock;
@@ -572,7 +568,7 @@ sack0_advance_pipe(sack0_sock *s, sack0_pipe *p, uint32_t next, uint32_t mask)
 	}
 	if (start != 0 && sack0_seq_le(next, start)) {
 		if (next == start) {
-			p->ack_mask |= (mask & 0xFFFFu);
+			p->ack_mask |= (mask & 0xFFFFFFFFu);
 			sack0_pipe_reclock(s, p);
 		}
 		return (0);
@@ -629,7 +625,7 @@ sack0_advance_pipe(sack0_sock *s, sack0_pipe *p, uint32_t next, uint32_t mask)
 		p->cwnd++;
 	}
 	p->ack_base = next;
-	p->ack_mask = mask & 0xFFFFu;
+	p->ack_mask = mask & 0xFFFFFFFFu;
 	sack0_pipe_reclock(s, p);
 	return (newly);
 }

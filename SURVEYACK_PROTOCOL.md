@@ -2,14 +2,14 @@
 
 Plain version: one publisher sends to many subscribers. Instead of
 every subscriber answering every message (expensive on the way back),
-the publisher sends up to 8 messages without stopping, and each
-subscriber answers roughly once per 8 messages with "everything up to
+the publisher sends up to 16 messages without stopping, and each
+subscriber answers roughly once per 16 messages with "everything up to
 here is done, except these holes". Lost holes are re-sent one by one.
 
 Technically: cloned from `survey0`, keeps the RTT-lite AIMD estimator
 (RTT sampling + congestion window), but replaces 1-ACK-per-survey
-with a window of up to 8 live surveys plus one cumulative ACK per
-~8 surveys.
+with a window of up to 16 live surveys plus one cumulative ACK per
+~16 surveys.
 
 ## Why (plain version)
 
@@ -43,9 +43,9 @@ One `#define` block controls everything. Plain meaning first,
 exact semantics after.
 
 ```c
-#define SACK0_RING_MAX  8   // window + repair buffer. Change ONLY here.
+#define SACK0_RING_MAX  16  // window + repair buffer. Change ONLY here.
 #define SACK0_ACK_BATCH SACK0_RING_MAX  // wrapper batch follows it
-#define SACK0_SACK_BITS 16  // SACK mask horizon above base
+#define SACK0_SACK_BITS 32  // SACK mask horizon above base
 #define SACK0_RTO_INIT 3000 / MIN 200 / MAX 60000 / AI_STEP 100
 #define SACK0_CWND_INIT 1 / MIN 1 / MAX 1024
 #define SACK0_RESEND_TICK 100
@@ -55,8 +55,8 @@ exact semantics after.
 
 | Knob                | Default           | Plain meaning                                                                                        | Technical meaning                                               |
 |---------------------|-------------------|------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------|
-| `RING_MAX`          | 8                 | How many messages may be "in the air" at once.                                                       | Live window slots + repair ring size; `ACK_BATCH` follows it.   |
-| `SACK_BITS`         | 16                | How many holes one ACK can describe.                                                                 | Bitmask width above the cumulative base.                        |
+| `RING_MAX`          | 16                | How many messages may be "in the air" at once.                                                       | Live window slots + repair ring size; `ACK_BATCH` follows it.   |
+| `SACK_BITS`         | 32                | How many holes one ACK can describe.                                                                 | Bitmask width above the cumulative base.                        |
 | `RTO_INIT/MIN/MAX`  | 3000/200/60000 ms | How long to wait before calling a message lost (starts careful, never below 200, never above 60000). | RFC 6298-style retransmission timeout bounds.                   |
 | `AI_STEP`           | 100 ms            | Safety margin so normal wobble is not mistaken for congestion.                                       | Added to the RTO computation only, never accumulated into SRTT. |
 | `CWND_INIT/MIN/MAX` | 1/1/1024          | Start with 1 message in flight; grow or shrink from there; never exceed 1024.                        | AIMD congestion window bounds.                                  |
@@ -64,8 +64,8 @@ exact semantics after.
 | `FANOUT_WAIT_MS`    | 200 ms            | How long to wait for a clogged pipe before skipping it.                                              | Bounded pacing wait per send (10 ms if only one pipe is slow).  |
 | `SEND_BUF`          | 128               | Per-connection waiting room.                                                                         | Per-pipe transport queue depth.                                 |
 
-Wrapper batch/delay (`nng_wrapper.h`): `NNG_SACK_BATCH 8` (one
-cumulative per 8 deliveries), `NNG_SACK_ACK_DELAY_MS 50` (a partial
+Wrapper batch/delay (`nng_wrapper.h`): `NNG_SACK_BATCH = SACK0_RING_MAX` (one
+cumulative per batch), `NNG_SACK_ACK_DELAY_MS 50` (a partial
 batch is flushed at most 50 ms after it stopped growing, even while
 the app is blocked in recv).
 
@@ -89,10 +89,10 @@ still routes them to the right conversation):
 "C6:2"    = need 6, SACK has 7 (mask bit1: have 6+1). LSB = seq <next>.
 ```
 
-Plain version: `C9` means "I have 1 through 8, send 9 next".
+Plain version: `C9` means "I have 1 through 8, send 9 next" (one ACK per batch of `SACK0_RING_MAX` sends).
 `C6:2` means "I'm still missing 6, but I already have 7". Mask bit
 `i` = "I have `next+i`". Size 2-10 bytes — about the same as a bare
-`"ACK"`, but one of them can close up to 8 messages plus 16 holes.
+`"ACK"`, but one of them can close up to 16 messages plus 32 holes.
 
 ## Files (all new code is a survey0 clone + window logic)
 
@@ -127,7 +127,7 @@ still pass.
 
 - **Live-window gating (the RTT-lite part).**
   Plain: the publisher may only have `cwnd` messages unanswered at a
-  time. On a clean link the allowance grows 1, 2, 3… up to 8; on a
+  time. On a clean link the allowance grows 1, 2, 3… up to 16; on a
   bad link it collapses back toward 1 and the sender automatically
   slows down. This is what turns "send as fast as possible" into
   congestion control.
@@ -197,7 +197,7 @@ still pass.
 
 - **Wrapper sub (subscriber side batching).**
   Plain: same deliver-once + prefix stripping as survey mode. Answers
-  go out every 8 messages, immediately on seeing a duplicate
+  go out every batch (`NNG_SACK_BATCH` = ring size), immediately on seeing a duplicate
   (fast-ACK: "the publisher is asking again, answer now"), a partial
   batch never waits more than 50 ms — and, since the flush-before-block
   fix, never waits at all when the publisher is starving: before every
@@ -205,7 +205,7 @@ still pass.
   nothing is ready yet but answers are pending, it flushes them right
   away. Streaming is unaffected (when messages keep arriving the peek
   always finds one, so no extra flush happens).
-  Exact: flush `C` every 8 (`NNG_SACK_BATCH`), immediate flush on
+  Exact: flush `C` every batch (`NNG_SACK_BATCH`), immediate flush on
   duplicate, 50 ms sliced blocking recv so partial tails flush, plus a
   one-shot nonblocking probe at the top of every blocking
   `nng_recvmsg_sack`/`nng_recv_sack` call (blocking mode only; the
@@ -268,7 +268,7 @@ MDs, pin `cwnd` at 1, and collapse throughput. The sudut-berat runs
 Why not larger (e.g. 10 s)? The worst-case sender stall per message
 *is* the full budget — we measured ~2020 ms outliers in IPC jitter
 when one cumulative ACK went missing before RTO trained. A bigger
-budget makes each such event cost more, holds 8 slots × payload in
+budget makes each such event cost more, holds 16 slots × payload in
 memory longer, and multiplies benchmark wall time (500 msgs × budget).
 
 Ordering invariant to preserve when tuning: gate budget (>=
@@ -339,10 +339,10 @@ Tail at stream end: sub calls `nng_sack_flush(sub)` after its last recv
 
 ## Limits (same family as before, documented)
 
-- Horizon 8: a hole unacked past eviction+deadline is dropped with one
+- Horizon 16: a hole unacked past eviction+deadline is dropped with one
   MD. Late joiners get replay of unacked slots via resend (their base
   is 0).
-  Plain version: the publisher only remembers the last 8 messages. A
+  Plain version: the publisher only remembers the last 16 messages. A
   subscriber that shows up late gets the unconfirmed ones replayed;
   anything older than that is gone, with one penalty recorded.
 - Window still slides without waiting for the slowest; laggards get hole
